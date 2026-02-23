@@ -12,9 +12,11 @@ The EdgeRouter 6P and EdgeRouter 4 are powered by the Cavium CN7130 SoC, which c
 a **COP2 cryptographic coprocessor** capable of hardware-accelerated AES and Galois Field
 Multiply (GFM/GHASH) — the two operations needed for AES-GCM.
 
-Ubiquiti's closed-source `cvm_ipsec_kame` driver uses this hardware for **AES-CBC** only.
-When you configure `aes128gcm128` in IPsec, EdgeOS silently falls back to a software
-implementation — even though the hardware fully supports it.
+Ubiquiti's closed-source `cvm_ipsec_kame` driver does not use this hardware for
+**AES-GCM**. When you configure `aes128gcm128` in IPsec, EdgeOS silently falls back
+to a software implementation — even though the hardware fully supports it. Ubiquiti's
+[hardware offload documentation](https://help.uisp.com/hc/en-us/articles/22591077433879-EdgeRouter-Hardware-Offloading)
+lists the supported algorithms, and AES-GCM is not among them.
 
 This was confirmed via **NIST CAVP certificate AES #3301**, which covers the CN7130's AES
 engine including GCM/GHASH, proving the hardware capability exists.
@@ -326,6 +328,9 @@ using your freshly built `.ko` instead of the pre-built one.
 - **[Lochnair/kernel_e300](https://github.com/Lochnair/kernel_e300)** — Community-maintained
   EdgeOS 4.9 kernel source, used as the build target (`KDIR`). Does not include
   `cvmx-asm.h`; used for kernel headers and the `octeon-crypto` module API only.
+- **[Ubiquiti EdgeRouter — Hardware Offloading](https://help.uisp.com/hc/en-us/articles/22591077433879-EdgeRouter-Hardware-Offloading)**
+  — Official Ubiquiti documentation listing the ESP algorithms supported for hardware
+  offload. AES-GCM is not listed, confirming the gap this module fills.
 - **[NIST CAVP AES Certificate #3301](https://csrc.nist.gov/projects/cryptographic-algorithm-validation-program/details?product=11151)**
   — Confirms CN7130 COP2 supports GCM/GHASH in hardware
 - **[RFC 4106](https://www.rfc-editor.org/rfc/rfc4106)** — The Use of Galois/Counter Mode (GCM) in IPsec Encapsulating Security Payload
