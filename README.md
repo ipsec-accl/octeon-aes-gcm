@@ -6,6 +6,13 @@ Enables IPsec ESP with `aes128gcm128` to use the router's built-in COP2 cryptogr
 coprocessor instead of falling back to software. Verified working on EdgeOS 2.0.9
 (Linux 4.9.79-UBNT) with StrongSwan 5.6.3.
 
+> **Use at your own risk.**
+> This is an unofficial, community-developed kernel module and is not supported by
+> Ubiquiti. Loading unsigned kernel modules carries inherent risk. It is strongly
+> recommended to **test on a backup or non-production router first** before deploying
+> to any device carrying critical traffic. Always keep a way to access the router
+> (serial console or physical access) in case something goes wrong.
+
 ## Background
 
 The EdgeRouter 6P and EdgeRouter 4 are powered by the Cavium CN7130 SoC, which contains
@@ -235,6 +242,23 @@ scp verify.sh admin@192.168.1.1:/tmp/
 ssh admin@192.168.1.1 "bash /tmp/verify.sh"
 ```
 
+### Note on software fallback
+
+If this module is not loaded, EdgeOS does not disable AES-GCM entirely — it falls
+back to a **software implementation** of AES-GCM via the Linux Crypto API. Your
+IPsec tunnels will still work with `aes128gcm128`; you just won't get hardware
+acceleration.
+
+This means the module is safe to unload or skip: removing it simply returns the
+router to the default software path. There is no functional difference in the
+resulting encrypted traffic — hardware and software GCM produce identical output.
+The only difference is performance and CPU load.
+
+| Mode | AES-GCM works? | Hardware accelerated? |
+|------|---------------|----------------------|
+| Without this module | Yes (software fallback) | No |
+| With this module loaded | Yes | Yes — COP2 coprocessor |
+
 ### IKE collision note (same-subnet peers)
 
 If both IPsec peers are on the **same ISP /64 IPv6 subnet** (common when the
@@ -376,6 +400,18 @@ for anyone working on similar Cavium COP2 drivers:
    This is `0xe1` in bits `[15:8]`, encoding the GCM reduction polynomial
    `1 + x + x^2 + x^7` with `x^0` at the MSB.
    *(Source: Marvell 4.14 `cvmx-asm.h` — `CVMX_MT_GFM_POLY` → `dmtc2 val, 0x025e`)*
+
+## Disclaimer
+
+This module is provided **as-is**, without warranty of any kind. It is not affiliated
+with or endorsed by Ubiquiti, Marvell, or Cavium.
+
+- Test on a **backup or non-production router** before deploying to production
+- Keep physical or serial console access available when loading unsigned kernel modules
+- If the module causes instability, unload it with `sudo rmmod octeon_aes_gcm` and
+  file an issue with your EdgeOS version and `dmesg` output
+
+Use at your own risk.
 
 ## License
 
