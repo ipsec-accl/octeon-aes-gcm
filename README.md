@@ -6,12 +6,25 @@ Enables IPsec ESP with `aes128gcm128` to use the router's built-in COP2 cryptogr
 coprocessor instead of falling back to software. Verified working on EdgeOS 2.0.9
 (Linux 4.9.79-UBNT) with StrongSwan 5.6.3.
 
-> **Use at your own risk.**
-> This is an unofficial, community-developed kernel module and is not supported by
-> Ubiquiti. Loading unsigned kernel modules carries inherent risk. It is strongly
-> recommended to **test on a backup or non-production router first** before deploying
-> to any device carrying critical traffic. Always keep a way to access the router
-> (serial console or physical access) in case something goes wrong.
+## 0. Disclaimer
+
+This module was developed with the help of [Claude Code](https://claude.ai/claude-code),
+which collected open-source information from publicly known repositories — primarily
+Marvell's official Octeon Linux 4.14 kernel tree — and guided the implementation.
+The module was cross-compiled on a Raspberry Pi 4 (Debian aarch64) targeting the
+EdgeRouter's MIPS64 processor.
+
+Claude Code confirmed the module loads and registers correctly, and IPsec tunnels
+appear to be working. Throughput felt subjectively faster, but I am not a hardware
+performance expert and cannot confirm this rigorously. Use your own judgment.
+
+**Use at your own risk.** This is an unofficial, community-developed kernel module
+and is not supported by Ubiquiti. Loading unsigned kernel modules carries inherent
+risk. It is strongly recommended to test on a **backup or non-production router
+first** before deploying to any device carrying critical traffic. Always keep a way
+to access the router (serial console or physical access) in case something goes wrong.
+
+This module is not affiliated with or endorsed by Ubiquiti, Marvell, or Cavium.
 
 ## 1. Background
 
@@ -166,7 +179,7 @@ Via the EdgeOS CLI:
 ```
 configure
 set vpn ipsec esp-group ESP_GCM proposal 1 encryption aes128gcm128
-set vpn ipsec esp-group ESP_GCM proposal 1 hash null
+set vpn ipsec esp-group ESP_GCM proposal 1 hash sha1
 commit
 save
 ```
@@ -176,16 +189,22 @@ Or in `/etc/ipsec.conf` / swanctl:
 esp=aes128gcm128!
 ```
 
-GCM is an AEAD cipher — it provides both encryption and authentication, so `hash null`
-is correct (there is no separate HMAC).
+GCM is an AEAD cipher — it provides both encryption and authentication in a single
+pass, so no separate HMAC is needed. The EdgeOS CLI, however, requires a value for
+the `hash` field and defaults to `sha1` even when an AEAD cipher is selected.
+Set `hash sha1` to match the EdgeOS default; StrongSwan ignores the hash field when
+an AEAD cipher is negotiated.
 
-**AES-192 and AES-256 are also supported** by this module. Replace `aes128gcm128` with:
+The example above uses **AES-128-GCM** — chosen as a starting point, not as a
+recommended default. AES-192 and AES-256 are also supported by the module (the COP2
+hardware handles all three key lengths), but only AES-128-GCM has been tested
+end-to-end in a live IPsec tunnel. Replace `aes128gcm128` with:
 
-| Variant | EdgeOS CLI | swanctl |
-|---------|-----------|---------|
-| AES-128-GCM (default) | `aes128gcm128` | `esp=aes128gcm128!` |
-| AES-192-GCM | `aes192gcm128` | `esp=aes192gcm128!` |
-| AES-256-GCM | `aes256gcm128` | `esp=aes256gcm128!` |
+| Variant | EdgeOS CLI | swanctl | Tested? |
+|---------|-----------|---------|---------|
+| AES-128-GCM | `aes128gcm128` | `esp=aes128gcm128!` | Yes |
+| AES-192-GCM | `aes192gcm128` | `esp=aes192gcm128!` | Not tested |
+| AES-256-GCM | `aes256gcm128` | `esp=aes256gcm128!` | Not tested |
 
 ### Step 6 — Verify hardware is being used
 
@@ -286,9 +305,40 @@ the backup reboots.
 
 ## 5. Building from source
 
-You need a Linux machine with a MIPS64 cross-compiler. I and Claude Code used a **Raspberry Pi 4**
-(Debian aarch64) — the instructions below are specific to that setup, but any
-Debian/Ubuntu machine (aarch64 or x86_64) works the same way.
+You need a **Linux build machine** with a MIPS64 cross-compiler — not the router itself.
+I used a Raspberry Pi 4 (Debian aarch64, 8 GB RAM), but any Debian/Ubuntu machine
+(x86_64 or aarch64) works the same way.
+
+### Directory layout on the build machine
+
+Two directories are required — the kernel source and this module source:
+
+```
+~/
+├── kernel_e300/               ← EdgeOS kernel source (cloned from Lochnair/kernel_e300)
+│   ├── Makefile               ← kernel build system (used by the module build, not modified)
+│   ├── arch/mips/             ← MIPS architecture headers needed to compile the module
+│   ├── include/               ← kernel headers
+│   └── ...                    ← rest of kernel tree (not modified, not booted)
+│
+└── octeon-aes-gcm/            ← this repo (cloned from GitHub)
+    └── src/
+        ├── octeon_aes_gcm.c   ← main driver source
+        ├── octeon_cop2.h      ← COP2 register definitions and assembly macros
+        └── Makefile           ← tells the kernel build system to compile octeon_aes_gcm.c
+```
+
+The module `Makefile` uses the `KDIR` variable to find the kernel source. The build
+command is run from `src/` and produces `src/octeon_aes_gcm.ko`:
+
+```bash
+cd ~/octeon-aes-gcm/src
+make KDIR=~/kernel_e300 CROSS_COMPILE=mips64-linux-gnuabi64- ARCH=mips
+```
+
+The paths (`~/kernel_e300`, `~/octeon-aes-gcm`) can be anything — just pass the
+correct `KDIR` to `make`. The kernel source does not need to be installed or booted;
+it is only used for its headers.
 
 ### Step 1 — Install the cross-compiler
 
