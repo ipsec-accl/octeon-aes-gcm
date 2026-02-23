@@ -57,13 +57,14 @@ The COP2 hardware provides:
 
 **Kernel**: EdgeOS 2.0.9 / Linux 4.9.79-UBNT
 
-Other Cavium Octeon III based devices running a 4.9 kernel should work. The COP2
-register map is from the CN7xxx Hardware Reference Manual and has been verified
-against the Cavium SDK (`cvmx-asm.h`).
+Other Cavium Octeon III based devices running a 4.9 kernel should work. COP2
+register addresses are sourced from
+[MarvellEmbeddedProcessors/Octeon-Linux-kernel-4.14](https://github.com/MarvellEmbeddedProcessors/Octeon-Linux-kernel-4.14)
+(`arch/mips/include/asm/octeon/cvmx-asm.h`).
 
 ## Installing the pre-built binary (no compilation needed)
 
-If you are running **EdgeOS 2.0.9**, you can use the pre-built `octeon_aes_gcm.ko` at the root of this repo.
+If you are running **EdgeOS 2.0.9**, you can use the pre-built kernel module (`octeon_aes_gcm.ko`) at the root of this repo.
 No cross-compiler or kernel source needed.
 
 If you are running a different EdgeOS version, see [Building from source](#building-from-source).
@@ -124,14 +125,14 @@ First, create the directory and upload the boot script from your local machine:
 
 ```bash
 # Run on your local machine:
-scp load-octeon-gcm.sh admin@192.168.1.1:/tmp/load-octeon-gcm.sh
+scp load-octeon-gcm.sh admin@192.168.1.1:/config/tmp/load-octeon-gcm.sh
 ```
 
 Then SSH into the router and install it:
 
 ```bash
 sudo mkdir -p /config/scripts/pre-config.d
-sudo cp /tmp/load-octeon-gcm.sh /config/scripts/pre-config.d/load-octeon-gcm.sh
+sudo cp /config/tmp/load-octeon-gcm.sh /config/scripts/pre-config.d/load-octeon-gcm.sh
 sudo chmod +x /config/scripts/pre-config.d/load-octeon-gcm.sh
 ```
 
@@ -147,8 +148,13 @@ ssh admin@192.168.1.1 "grep octeon-aes-gcm /var/log/messages"
 
 ### Step 5 — Configure IPsec to use AES-GCM
 
+If you already have an IPsec tunnel configured, you just need to update (or add) the
+ESP proposal to use AES-GCM. If you are starting from scratch, configure your tunnel
+as usual and set the ESP encryption to one of the AES-GCM variants below.
+
+Via the EdgeOS CLI:
+
 ```
-# EdgeOS CLI
 configure
 set vpn ipsec esp-group ESP_GCM proposal 1 encryption aes128gcm128
 set vpn ipsec esp-group ESP_GCM proposal 1 hash null
@@ -164,11 +170,46 @@ esp=aes128gcm128!
 GCM is an AEAD cipher — it provides both encryption and authentication, so `hash null`
 is correct (there is no separate HMAC).
 
+**AES-192 and AES-256 are also supported** by this module. Replace `aes128gcm128` with:
+
+| Variant | EdgeOS CLI | swanctl |
+|---------|-----------|---------|
+| AES-128-GCM (default) | `aes128gcm128` | `esp=aes128gcm128!` |
+| AES-192-GCM | `aes192gcm128` | `esp=aes192gcm128!` |
+| AES-256-GCM | `aes256gcm128` | `esp=aes256gcm128!` |
+
 ### Step 6 — Verify hardware is being used
 
-After establishing an IPsec tunnel, confirm the hardware is actually processing packets
-(not software fallback) by checking that `XfrmInStateProtoError` does not increment
-during traffic through the tunnel:
+**Check 1 — Confirm the driver registered in the kernel crypto API:**
+
+```bash
+grep -A 2 "octeon-rfc4106-gcm-aes" /proc/crypto
+```
+
+Expected output:
+```
+name         : rfc4106(gcm(aes))
+driver       : octeon-rfc4106-gcm-aes
+```
+
+If `driver` shows `generic-gcm-aes` or similar instead, the hardware module did not
+load — check `dmesg | grep octeon-aes-gcm` for errors.
+
+**Check 2 — Confirm the active IPsec SA is using the hardware algorithm:**
+
+After establishing the tunnel, SSH into the router and run:
+
+```bash
+sudo ip xfrm state | grep -E "proto|aead"
+```
+
+Expected output includes:
+```
+proto esp ...
+    aead rfc4106(gcm(aes)) ...
+```
+
+**Check 3 — Live traffic test (no decryption errors):**
 
 ```bash
 # On the receiving router — note the baseline count:
@@ -182,7 +223,7 @@ grep InStateProtoError /proc/net/xfrm_stat
 ```
 
 `XfrmInStateProtoError` increments when the kernel receives an ESP packet but fails
-to decrypt/authenticate it. Zero increment means hardware GCM is producing correct
+to decrypt/authenticate it. Zero increment confirms the hardware is producing correct
 ciphertext and authentication tags.
 
 You can also run `verify.sh` on the router:
@@ -285,12 +326,11 @@ using your freshly built `.ko` instead of the pre-built one.
 - **[Lochnair/kernel_e300](https://github.com/Lochnair/kernel_e300)** — Community-maintained
   EdgeOS 4.9 kernel source, used as the build target (`KDIR`). Does not include
   `cvmx-asm.h`; used for kernel headers and the `octeon-crypto` module API only.
-- **Cavium CN7xxx Hardware Reference Manual** — COP2 Cryptographic Acceleration chapter
-  (background reading on the COP2 architecture and instruction encoding).
-- **NIST CAVP AES Certificate #3301** — Confirms CN7130 COP2 supports GCM/GHASH
-- **RFC 4106** — The Use of Galois/Counter Mode (GCM) in IPsec Encapsulating Security Payload
-- **NIST SP 800-38D** — Recommendation for Block Cipher Modes of Operation: GCM and GMAC
-- **Linux Kernel Crypto API** — `include/crypto/aead.h`, `include/crypto/internal/aead.h`
+- **[NIST CAVP AES Certificate #3301](https://csrc.nist.gov/projects/cryptographic-algorithm-validation-program/details?product=11151)**
+  — Confirms CN7130 COP2 supports GCM/GHASH in hardware
+- **[RFC 4106](https://www.rfc-editor.org/rfc/rfc4106)** — The Use of Galois/Counter Mode (GCM) in IPsec Encapsulating Security Payload
+- **[NIST SP 800-38D](https://csrc.nist.gov/publications/detail/sp/800-38d/final)** — Recommendation for Block Cipher Modes of Operation: GCM and GMAC
+- **[Linux Kernel Crypto API](https://www.kernel.org/doc/html/latest/crypto/index.html)** — `include/crypto/aead.h`, `include/crypto/internal/aead.h`
 
 ## Key implementation notes
 
