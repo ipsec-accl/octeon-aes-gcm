@@ -1,0 +1,12 @@
+# Build artifacts
+src/*.o
+src/*.ko
+src/*.mod
+src/*.mod.c
+src/.*.cmd
+src/modules.order
+src/Module.symvers
+src/.tmp_versions/
+
+# macOS
+.DS_Store
