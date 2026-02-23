@@ -13,7 +13,7 @@ coprocessor instead of falling back to software. Verified working on EdgeOS 2.0.
 > to any device carrying critical traffic. Always keep a way to access the router
 > (serial console or physical access) in case something goes wrong.
 
-## Background
+## 1. Background
 
 The EdgeRouter 6P and EdgeRouter 4 are powered by the Cavium CN7130 SoC, which contains
 a **COP2 cryptographic coprocessor** capable of hardware-accelerated AES and Galois Field
@@ -30,7 +30,7 @@ engine including GCM/GHASH, proving the hardware capability exists.
 
 This module fills that gap.
 
-## How it differs from Ubiquiti's AES-CBC offload
+## 2. How it differs from Ubiquiti's AES-CBC offload
 
 Both use the **same COP2 hardware**. The difference is the software path:
 
@@ -56,7 +56,7 @@ The COP2 hardware provides:
 - **GFM (Galois Field Multiply-Accumulate)** — used for GHASH, computing the
   authentication tag over AAD + ciphertext
 
-## Supported hardware
+## 3. Supported hardware
 
 | Device | SoC | Status |
 |--------|-----|--------|
@@ -71,7 +71,7 @@ register addresses are sourced from
 [MarvellEmbeddedProcessors/Octeon-Linux-kernel-4.14](https://github.com/MarvellEmbeddedProcessors/Octeon-Linux-kernel-4.14)
 (`arch/mips/include/asm/octeon/cvmx-asm.h`).
 
-## Installing the pre-built binary (no compilation needed)
+## 4. Installing the pre-built binary (no compilation needed)
 
 If you are running **EdgeOS 2.0.9**, you can use the pre-built kernel module (`octeon_aes_gcm.ko`) at the root of this repo.
 No cross-compiler or kernel source needed.
@@ -284,7 +284,7 @@ This eliminates the ACQUIRE loop on the primary router. The backup router remain
 the sole initiator; the primary only responds. Tunnel re-establishes cleanly after
 the backup reboots.
 
-## Building from source
+## 5. Building from source
 
 You need a Linux machine with a MIPS64 cross-compiler. I and Claude Code used a **Raspberry Pi 4**
 (Debian aarch64) — the instructions below are specific to that setup, but any
@@ -338,7 +338,7 @@ Output: `src/octeon_aes_gcm.ko`
 Then follow the [install steps above](#installing-the-pre-built-binary-no-compilation-needed)
 using your freshly built `.ko` instead of the pre-built one.
 
-## References
+## 6. References
 
 - **[MarvellEmbeddedProcessors/Octeon-Linux-kernel-4.14](https://github.com/MarvellEmbeddedProcessors/Octeon-Linux-kernel-4.14)**
   — Marvell's official Octeon Linux 4.14 kernel tree. The primary reference for all
@@ -361,7 +361,7 @@ using your freshly built `.ko` instead of the pre-built one.
 - **[NIST SP 800-38D](https://csrc.nist.gov/publications/detail/sp/800-38d/final)** — Recommendation for Block Cipher Modes of Operation: GCM and GMAC
 - **[Linux Kernel Crypto API](https://www.kernel.org/doc/html/latest/crypto/index.html)** — `include/crypto/aead.h`, `include/crypto/internal/aead.h`
 
-## Key implementation notes
+## 7. Key implementation notes
 
 The following bugs were discovered and fixed during development — documented here
 for anyone working on similar Cavium COP2 drivers:
@@ -401,7 +401,7 @@ for anyone working on similar Cavium COP2 drivers:
    `1 + x + x^2 + x^7` with `x^0` at the MSB.
    *(Source: Marvell 4.14 `cvmx-asm.h` — `CVMX_MT_GFM_POLY` → `dmtc2 val, 0x025e`)*
 
-## Disclaimer
+## 8. Disclaimer
 
 This module is provided **as-is**, without warranty of any kind. It is not affiliated
 with or endorsed by Ubiquiti, Marvell, or Cavium.
@@ -413,6 +413,6 @@ with or endorsed by Ubiquiti, Marvell, or Cavium.
 
 Use at your own risk.
 
-## License
+## 9. License
 
 GPL-2.0 — required for Linux kernel modules.
