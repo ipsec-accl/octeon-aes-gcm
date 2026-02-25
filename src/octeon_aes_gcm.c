@@ -373,6 +373,12 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 	u8 *aad_buf = NULL;
 	unsigned int i;
 
+	/* Validate assoclen: must be 16 (standard) or 20 (ESN). Per rfc4106,
+	 * assoclen = ESP_header(8) + explicit_IV(8), or + ESN(4) = 20.
+	 * Matches kernel rfc4106 wrapper check (crypto/gcm.c:867). */
+	if (assoclen != 16 && assoclen != 20)
+		return -EINVAL;
+
 	/* Build J0: nonce(4) || IV(8) || 0x00000001 */
 	octeon_rfc4106_build_j0(ctx, req->iv, rctx->j0);
 
@@ -524,8 +530,13 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	u8 tag_computed[GCM_MAX_AUTH_SIZE];
 	u8 tag_received[GCM_MAX_AUTH_SIZE];
 	u8 *aad_buf = NULL;
+	u8 *ct_buf = NULL, *pt_buf = NULL;
 	unsigned int i;
 	int ret;
+
+	/* Validate assoclen per rfc4106 contract (crypto/gcm.c:867) */
+	if (assoclen != 16 && assoclen != 20)
+		return -EINVAL;
 
 	/* cryptlen includes the auth tag for decrypt */
 	if (cryptlen < ctx->authsize)
@@ -569,10 +580,11 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 		}
 	}
 
-	/* GHASH ciphertext, then decrypt */
+	/*
+	 * GHASH ciphertext, then CTR-decrypt into pt_buf.
+	 * Do NOT write pt_buf to dst yet — wait until tag is verified.
+	 */
 	if (ct_len > 0) {
-		u8 *ct_buf, *pt_buf;
-
 		ct_buf = kmalloc(ct_len, GFP_ATOMIC);
 		pt_buf = kmalloc(ct_len, GFP_ATOMIC);
 		if (!ct_buf || !pt_buf) {
@@ -607,29 +619,6 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 				pos += block_len;
 			}
 		}
-
-		/* Copy AAD if src != dst */
-		if (req->src != req->dst && assoclen > 0) {
-			u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
-			if (!tmp) {
-				kfree(ct_buf);
-				kfree(pt_buf);
-				octeon_crypto_disable(&cop2_state, cop2_flags);
-				return -ENOMEM;
-			}
-			scatterwalk_map_and_copy(tmp, req->src,
-						 0, assoclen, 0);
-			scatterwalk_map_and_copy(tmp, req->dst,
-						 0, assoclen, 1);
-			kfree(tmp);
-		}
-
-		/* Write plaintext to dst */
-		scatterwalk_map_and_copy(pt_buf, req->dst, assoclen,
-					 ct_len, 1);
-
-		kfree(ct_buf);
-		kfree(pt_buf);
 	}
 
 	/* Finalize GHASH: length block uses actual AAD bytes (not incl. IV) */
@@ -647,20 +636,38 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	ret = crypto_memneq(tag_computed, tag_received, ctx->authsize);
 	if (ret) {
 		/*
-		 * Authentication failed. Zero the output to prevent
-		 * leaking unauthenticated plaintext.
+		 * Authentication failed. dst was never written — no
+		 * unauthenticated plaintext is visible to the caller.
 		 */
-		if (ct_len > 0) {
-			u8 *zero = kzalloc(ct_len, GFP_ATOMIC);
-			if (zero) {
-				scatterwalk_map_and_copy(zero, req->dst,
-							 assoclen, ct_len, 1);
-				kfree(zero);
-			}
-		}
+		kfree(ct_buf);
+		kfree(pt_buf);
 		return -EBADMSG;
 	}
 
+	/*
+	 * Tag verified. Now safe to write output to dst.
+	 * AAD copy is outside the ct_len guard so it always runs
+	 * when src != dst, regardless of payload length.
+	 */
+	if (req->src != req->dst && assoclen > 0) {
+		u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
+		if (!tmp) {
+			kfree(ct_buf);
+			kfree(pt_buf);
+			return -ENOMEM;
+		}
+		scatterwalk_map_and_copy(tmp, req->src, 0, assoclen, 0);
+		scatterwalk_map_and_copy(tmp, req->dst, 0, assoclen, 1);
+		kfree(tmp);
+	}
+
+	if (ct_len > 0) {
+		scatterwalk_map_and_copy(pt_buf, req->dst, assoclen,
+					 ct_len, 1);
+	}
+
+	kfree(ct_buf);
+	kfree(pt_buf);
 	return 0;
 }
 
@@ -784,6 +791,7 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	u8 tag_computed[GCM_MAX_AUTH_SIZE];
 	u8 tag_received[GCM_MAX_AUTH_SIZE];
 	u8 *aad_buf = NULL;
+	u8 *ct_buf = NULL, *pt_buf = NULL;
 	unsigned int i;
 	int ret;
 
@@ -815,9 +823,11 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 		kfree(aad_buf);
 	}
 
+	/*
+	 * GHASH ciphertext, then CTR-decrypt into pt_buf.
+	 * Do NOT write pt_buf to dst yet — wait until tag is verified.
+	 */
 	if (ct_len > 0) {
-		u8 *ct_buf, *pt_buf;
-
 		ct_buf = kmalloc(ct_len, GFP_ATOMIC);
 		pt_buf = kmalloc(ct_len, GFP_ATOMIC);
 		if (!ct_buf || !pt_buf) {
@@ -848,27 +858,6 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 				pos += block_len;
 			}
 		}
-
-		if (req->src != req->dst && assoclen > 0) {
-			u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
-			if (!tmp) {
-				kfree(ct_buf);
-				kfree(pt_buf);
-				octeon_crypto_disable(&cop2_state, cop2_flags);
-				return -ENOMEM;
-			}
-			scatterwalk_map_and_copy(tmp, req->src,
-						 0, assoclen, 0);
-			scatterwalk_map_and_copy(tmp, req->dst,
-						 0, assoclen, 1);
-			kfree(tmp);
-		}
-
-		scatterwalk_map_and_copy(pt_buf, req->dst, assoclen,
-					 ct_len, 1);
-
-		kfree(ct_buf);
-		kfree(pt_buf);
 	}
 
 	octeon_gcm_ghash_final(assoclen, ct_len, tag_calc);
@@ -880,17 +869,39 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 
 	ret = crypto_memneq(tag_computed, tag_received, ctx->authsize);
 	if (ret) {
-		if (ct_len > 0) {
-			u8 *zero = kzalloc(ct_len, GFP_ATOMIC);
-			if (zero) {
-				scatterwalk_map_and_copy(zero, req->dst,
-							 assoclen, ct_len, 1);
-				kfree(zero);
-			}
-		}
+		/*
+		 * Authentication failed. dst was never written — no
+		 * unauthenticated plaintext is visible to the caller.
+		 */
+		kfree(ct_buf);
+		kfree(pt_buf);
 		return -EBADMSG;
 	}
 
+	/*
+	 * Tag verified. Now safe to write output to dst.
+	 * AAD copy is outside the ct_len guard so it always runs
+	 * when src != dst, regardless of payload length.
+	 */
+	if (req->src != req->dst && assoclen > 0) {
+		u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
+		if (!tmp) {
+			kfree(ct_buf);
+			kfree(pt_buf);
+			return -ENOMEM;
+		}
+		scatterwalk_map_and_copy(tmp, req->src, 0, assoclen, 0);
+		scatterwalk_map_and_copy(tmp, req->dst, 0, assoclen, 1);
+		kfree(tmp);
+	}
+
+	if (ct_len > 0) {
+		scatterwalk_map_and_copy(pt_buf, req->dst, assoclen,
+					 ct_len, 1);
+	}
+
+	kfree(ct_buf);
+	kfree(pt_buf);
 	return 0;
 }
 
