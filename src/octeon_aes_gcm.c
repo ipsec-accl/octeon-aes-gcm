@@ -56,6 +56,10 @@
 /* Algorithm priority — higher than software (~100-300) */
 #define OCTEON_GCM_PRIORITY 500
 
+/* Inline scratch buffer size — covers standard 1500-byte MTU plus ESP overhead.
+ * Packets at or below this size need no heap allocation for pt_buf/ct_buf. */
+#define OCTEON_GCM_INLINE_BUF_SIZE 1600
+
 /*
  * Per-transform context (allocated once per setkey).
  * Stored in crypto_aead_ctx(tfm).
@@ -84,6 +88,13 @@ struct octeon_gcm_reqctx {
 	u64 counter[2];                   /* Running CTR counter (u64 for COP2 AES input)    */
 	u8 tag_enc[GCM_BLOCK_SIZE];       /* AES_K(J0) for final tag XOR */
 	u8 keystream[GCM_BLOCK_SIZE];     /* CTR keystream block         */
+	/*
+	 * Inline scratch space for ct_buf and pt_buf.
+	 * [0 .. OCTEON_GCM_INLINE_BUF_SIZE-1]      → ct_buf
+	 * [OCTEON_GCM_INLINE_BUF_SIZE .. *2-1]     → pt_buf
+	 * Covers standard MTU packets without heap allocation.
+	 */
+	u8 inline_buf[OCTEON_GCM_INLINE_BUF_SIZE * 2];
 };
 
 
@@ -274,6 +285,35 @@ static void octeon_gcm_ctr_crypt(struct octeon_gcm_reqctx *rctx,
 }
 
 
+/*
+ * Scratch buffer helpers for pt_buf / ct_buf.
+ *
+ * For packets ≤ OCTEON_GCM_INLINE_BUF_SIZE, return a pointer into the
+ * per-request inline_buf (no heap allocation).  For larger packets (jumbo
+ * frames), fall back to kmalloc(GFP_ATOMIC).
+ *
+ * Callers pass:
+ *   offset  — 0 for ct_buf, OCTEON_GCM_INLINE_BUF_SIZE for pt_buf
+ *   heap    — set to true when the returned buffer is heap-allocated
+ */
+static u8 *gcm_buf_get(struct octeon_gcm_reqctx *rctx,
+			unsigned int offset, unsigned int size, bool *heap)
+{
+	if (size <= OCTEON_GCM_INLINE_BUF_SIZE) {
+		*heap = false;
+		return rctx->inline_buf + offset;
+	}
+	*heap = true;
+	return kmalloc(size, GFP_ATOMIC);
+}
+
+static void gcm_buf_put(u8 *buf, bool heap)
+{
+	if (heap)
+		kfree(buf);
+}
+
+
 /* =========================================================================
  * Crypto API Callbacks
  * ========================================================================= */
@@ -447,12 +487,14 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 	 */
 	if (cryptlen > 0) {
 		u8 *pt_buf, *ct_buf;
+		bool pt_heap, ct_heap;
 
-		pt_buf = kmalloc(cryptlen, GFP_ATOMIC);
-		ct_buf = kmalloc(cryptlen, GFP_ATOMIC);
+		pt_buf = gcm_buf_get(rctx, 0, cryptlen, &pt_heap);
+		ct_buf = gcm_buf_get(rctx, OCTEON_GCM_INLINE_BUF_SIZE,
+				     cryptlen, &ct_heap);
 		if (!pt_buf || !ct_buf) {
-			kfree(pt_buf);
-			kfree(ct_buf);
+			gcm_buf_put(pt_buf, pt_heap);
+			gcm_buf_put(ct_buf, ct_heap);
 			octeon_crypto_disable(&cop2_state, cop2_flags);
 			return -ENOMEM;
 		}
@@ -469,8 +511,8 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 		scatterwalk_map_and_copy(ct_buf, req->dst, assoclen,
 					 cryptlen, 1);
 
-		kfree(pt_buf);
-		kfree(ct_buf);
+		gcm_buf_put(pt_buf, pt_heap);
+		gcm_buf_put(ct_buf, ct_heap);
 	}
 
 	/* Finalize GHASH: length block uses actual AAD bytes (not incl. IV) */
@@ -518,6 +560,7 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	 * Kept alive past the COP2 section for the post-verify dst copy. */
 	u8 aad[20];
 	u8 *ct_buf = NULL, *pt_buf = NULL;
+	bool ct_heap = false, pt_heap = false;
 	int ret;
 
 	/* Validate assoclen per rfc4106 contract (crypto/gcm.c:867) */
@@ -562,11 +605,12 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	 * Do NOT write pt_buf to dst yet — wait until tag is verified.
 	 */
 	if (ct_len > 0) {
-		ct_buf = kmalloc(ct_len, GFP_ATOMIC);
-		pt_buf = kmalloc(ct_len, GFP_ATOMIC);
+		ct_buf = gcm_buf_get(rctx, 0, ct_len, &ct_heap);
+		pt_buf = gcm_buf_get(rctx, OCTEON_GCM_INLINE_BUF_SIZE,
+				     ct_len, &pt_heap);
 		if (!ct_buf || !pt_buf) {
-			kfree(ct_buf);
-			kfree(pt_buf);
+			gcm_buf_put(ct_buf, ct_heap);
+			gcm_buf_put(pt_buf, pt_heap);
 			octeon_crypto_disable(&cop2_state, cop2_flags);
 			return -ENOMEM;
 		}
@@ -597,8 +641,8 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 		 * Authentication failed. dst was never written — no
 		 * unauthenticated plaintext is visible to the caller.
 		 */
-		kfree(ct_buf);
-		kfree(pt_buf);
+		gcm_buf_put(ct_buf, ct_heap);
+		gcm_buf_put(pt_buf, pt_heap);
 		return -EBADMSG;
 	}
 
@@ -616,8 +660,8 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 					 ct_len, 1);
 	}
 
-	kfree(ct_buf);
-	kfree(pt_buf);
+	gcm_buf_put(ct_buf, ct_heap);
+	gcm_buf_put(pt_buf, pt_heap);
 	return 0;
 }
 
@@ -672,12 +716,14 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 
 	if (cryptlen > 0) {
 		u8 *pt_buf, *ct_buf;
+		bool pt_heap, ct_heap;
 
-		pt_buf = kmalloc(cryptlen, GFP_ATOMIC);
-		ct_buf = kmalloc(cryptlen, GFP_ATOMIC);
+		pt_buf = gcm_buf_get(rctx, 0, cryptlen, &pt_heap);
+		ct_buf = gcm_buf_get(rctx, OCTEON_GCM_INLINE_BUF_SIZE,
+				     cryptlen, &ct_heap);
 		if (!pt_buf || !ct_buf) {
-			kfree(pt_buf);
-			kfree(ct_buf);
+			gcm_buf_put(pt_buf, pt_heap);
+			gcm_buf_put(ct_buf, ct_heap);
 			octeon_crypto_disable(&cop2_state, cop2_flags);
 			return -ENOMEM;
 		}
@@ -689,8 +735,8 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 		scatterwalk_map_and_copy(ct_buf, req->dst, assoclen,
 					 cryptlen, 1);
 
-		kfree(pt_buf);
-		kfree(ct_buf);
+		gcm_buf_put(pt_buf, pt_heap);
+		gcm_buf_put(ct_buf, ct_heap);
 	}
 
 	octeon_gcm_ghash_final(assoclen, cryptlen, tag);
@@ -723,6 +769,7 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	u8 tag_received[GCM_MAX_AUTH_SIZE];
 	u8 *aad_buf = NULL;
 	u8 *ct_buf = NULL, *pt_buf = NULL;
+	bool ct_heap = false, pt_heap = false;
 	int ret;
 
 	if (cryptlen < ctx->authsize)
@@ -759,11 +806,12 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	 * Do NOT write pt_buf to dst yet — wait until tag is verified.
 	 */
 	if (ct_len > 0) {
-		ct_buf = kmalloc(ct_len, GFP_ATOMIC);
-		pt_buf = kmalloc(ct_len, GFP_ATOMIC);
+		ct_buf = gcm_buf_get(rctx, 0, ct_len, &ct_heap);
+		pt_buf = gcm_buf_get(rctx, OCTEON_GCM_INLINE_BUF_SIZE,
+				     ct_len, &pt_heap);
 		if (!ct_buf || !pt_buf) {
-			kfree(ct_buf);
-			kfree(pt_buf);
+			gcm_buf_put(ct_buf, ct_heap);
+			gcm_buf_put(pt_buf, pt_heap);
 			octeon_crypto_disable(&cop2_state, cop2_flags);
 			return -ENOMEM;
 		}
@@ -786,8 +834,8 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 		 * Authentication failed. dst was never written — no
 		 * unauthenticated plaintext is visible to the caller.
 		 */
-		kfree(ct_buf);
-		kfree(pt_buf);
+		gcm_buf_put(ct_buf, ct_heap);
+		gcm_buf_put(pt_buf, pt_heap);
 		return -EBADMSG;
 	}
 
@@ -799,8 +847,8 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	if (req->src != req->dst && assoclen > 0) {
 		u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
 		if (!tmp) {
-			kfree(ct_buf);
-			kfree(pt_buf);
+			gcm_buf_put(ct_buf, ct_heap);
+			gcm_buf_put(pt_buf, pt_heap);
 			return -ENOMEM;
 		}
 		scatterwalk_map_and_copy(tmp, req->src, 0, assoclen, 0);
@@ -813,8 +861,8 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 					 ct_len, 1);
 	}
 
-	kfree(ct_buf);
-	kfree(pt_buf);
+	gcm_buf_put(ct_buf, ct_heap);
+	gcm_buf_put(pt_buf, pt_heap);
 	return 0;
 }
 
