@@ -370,7 +370,8 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 	unsigned int cryptlen = req->cryptlen;
 	u64 tag[2];
 	u8 tag_bytes[GCM_MAX_AUTH_SIZE];
-	u8 *aad_buf = NULL;
+	/* Stack buffer for rfc4106 AAD: assoclen is 16 or 20 (validated below) */
+	u8 aad[20];
 	unsigned int i;
 
 	/* Validate assoclen: must be 16 (standard) or 20 (ESN). Per rfc4106,
@@ -398,40 +399,17 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 	octeon_gfm_init(ctx->hash_subkey);
 
 	/*
-	 * GHASH: Process AAD
+	 * GHASH: Process AAD (ESP header only, not the explicit IV).
 	 *
-	 * For rfc4106, assoclen = ESP_header(8) + explicit_IV(8) = 16 bytes.
-	 * Only the ESP header (first assoclen - GCM_RFC4106_IV_SIZE bytes) is
-	 * authenticated; the explicit IV is used for J0, not for GHASH.
-	 * This matches the generic rfc4106 wrapper (crypto/gcm.c) behaviour.
+	 * Read the full assoclen bytes from src into a stack buffer.
+	 * GHASH only the first (assoclen - 8) bytes (SPI + SeqNum).
+	 * Copy all assoclen bytes to dst if src != dst.
+	 * No heap allocation needed — assoclen is at most 20 bytes.
 	 */
-	{
-		unsigned int aad_auth_len = assoclen - GCM_RFC4106_IV_SIZE;
-
-		if (aad_auth_len > 0) {
-			aad_buf = kmalloc(aad_auth_len, GFP_ATOMIC);
-			if (!aad_buf) {
-				octeon_crypto_disable(&cop2_state, cop2_flags);
-				return -ENOMEM;
-			}
-			scatterwalk_map_and_copy(aad_buf, req->src, 0,
-						 aad_auth_len, 0);
-			octeon_gcm_ghash_aad(aad_buf, aad_auth_len);
-			kfree(aad_buf);
-		}
-	}
-
-	/* Copy AAD from src to dst if they differ */
-	if (req->src != req->dst && assoclen > 0) {
-		u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
-		if (!tmp) {
-			octeon_crypto_disable(&cop2_state, cop2_flags);
-			return -ENOMEM;
-		}
-		scatterwalk_map_and_copy(tmp, req->src, 0, assoclen, 0);
-		scatterwalk_map_and_copy(tmp, req->dst, 0, assoclen, 1);
-		kfree(tmp);
-	}
+	scatterwalk_map_and_copy(aad, req->src, 0, assoclen, 0);
+	octeon_gcm_ghash_aad(aad, assoclen - GCM_RFC4106_IV_SIZE);
+	if (req->src != req->dst)
+		scatterwalk_map_and_copy(aad, req->dst, 0, assoclen, 1);
 
 	/*
 	 * Process plaintext → ciphertext via CTR mode.
@@ -529,7 +507,9 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	u64 tag_calc[2];
 	u8 tag_computed[GCM_MAX_AUTH_SIZE];
 	u8 tag_received[GCM_MAX_AUTH_SIZE];
-	u8 *aad_buf = NULL;
+	/* Stack buffer for rfc4106 AAD: assoclen is 16 or 20 (validated below).
+	 * Kept alive past the COP2 section for the post-verify dst copy. */
+	u8 aad[20];
 	u8 *ct_buf = NULL, *pt_buf = NULL;
 	unsigned int i;
 	int ret;
@@ -563,22 +543,12 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	/* Initialize GHASH */
 	octeon_gfm_init(ctx->hash_subkey);
 
-	/* GHASH: Process AAD (ESP header only, excluding explicit IV) */
-	{
-		unsigned int aad_auth_len = assoclen - GCM_RFC4106_IV_SIZE;
-
-		if (aad_auth_len > 0) {
-			aad_buf = kmalloc(aad_auth_len, GFP_ATOMIC);
-			if (!aad_buf) {
-				octeon_crypto_disable(&cop2_state, cop2_flags);
-				return -ENOMEM;
-			}
-			scatterwalk_map_and_copy(aad_buf, req->src, 0,
-						 aad_auth_len, 0);
-			octeon_gcm_ghash_aad(aad_buf, aad_auth_len);
-			kfree(aad_buf);
-		}
-	}
+	/*
+	 * GHASH: Process AAD (ESP header only, not the explicit IV).
+	 * Read once into stack buffer; reuse for dst copy after tag verify.
+	 */
+	scatterwalk_map_and_copy(aad, req->src, 0, assoclen, 0);
+	octeon_gcm_ghash_aad(aad, assoclen - GCM_RFC4106_IV_SIZE);
 
 	/*
 	 * GHASH ciphertext, then CTR-decrypt into pt_buf.
@@ -648,18 +618,10 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	 * Tag verified. Now safe to write output to dst.
 	 * AAD copy is outside the ct_len guard so it always runs
 	 * when src != dst, regardless of payload length.
+	 * Reuse the aad[] stack buffer read earlier — no extra allocation.
 	 */
-	if (req->src != req->dst && assoclen > 0) {
-		u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
-		if (!tmp) {
-			kfree(ct_buf);
-			kfree(pt_buf);
-			return -ENOMEM;
-		}
-		scatterwalk_map_and_copy(tmp, req->src, 0, assoclen, 0);
-		scatterwalk_map_and_copy(tmp, req->dst, 0, assoclen, 1);
-		kfree(tmp);
-	}
+	if (req->src != req->dst)
+		scatterwalk_map_and_copy(aad, req->dst, 0, assoclen, 1);
 
 	if (ct_len > 0) {
 		scatterwalk_map_and_copy(pt_buf, req->dst, assoclen,
