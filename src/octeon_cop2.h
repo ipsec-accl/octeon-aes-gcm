@@ -278,9 +278,10 @@ static inline void octeon_gfm_read_result(u64 *result)
  * Increment the 32-bit big-endian counter in the last 4 bytes of
  * a 16-byte counter block (GCM J0 format: Nonce[12] || Counter[4]).
  */
-static inline void gcm_counter_inc(u8 *ctr_block)
+static inline void gcm_counter_inc(u64 *ctr_block)
 {
-	put_unaligned_be32(get_unaligned_be32(ctr_block + 12) + 1, ctr_block + 12);
+	put_unaligned_be32(get_unaligned_be32((u8 *)ctr_block + 12) + 1,
+			   (u8 *)ctr_block + 12);
 }
 
 #endif /* _OCTEON_COP2_H */

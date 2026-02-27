@@ -80,11 +80,10 @@ struct octeon_gcm_ctx {
  * Allocated via aead_request_ctx(req).
  */
 struct octeon_gcm_reqctx {
-	/* Working buffers — avoid stack allocation for large blocks */
-	u8 j0[GCM_BLOCK_SIZE];           /* Initial counter block       */
-	u8 counter[GCM_BLOCK_SIZE];      /* Running CTR counter         */
-	u8 tag_enc[GCM_BLOCK_SIZE];      /* AES_K(J0) for final tag XOR */
-	u8 keystream[GCM_BLOCK_SIZE];    /* CTR keystream block         */
+	u64 j0[2];                        /* Initial counter block (u64 for COP2 AES input)  */
+	u64 counter[2];                   /* Running CTR counter (u64 for COP2 AES input)    */
+	u8 tag_enc[GCM_BLOCK_SIZE];       /* AES_K(J0) for final tag XOR */
+	u8 keystream[GCM_BLOCK_SIZE];     /* CTR keystream block         */
 };
 
 
@@ -134,27 +133,31 @@ static inline void octeon_gcm_load_key(const struct octeon_gcm_ctx *ctx)
  * Build J0 for rfc4106: nonce(4) || IV(8) || 0x00000001
  */
 static void octeon_rfc4106_build_j0(const struct octeon_gcm_ctx *ctx,
-				    const u8 *iv, u8 *j0)
+				    const u8 *iv, u64 *j0)
 {
-	memcpy(j0, ctx->nonce, GCM_NONCE_SIZE);
-	memcpy(j0 + GCM_NONCE_SIZE, iv, GCM_RFC4106_IV_SIZE);
-	j0[12] = 0x00;
-	j0[13] = 0x00;
-	j0[14] = 0x00;
-	j0[15] = 0x01;
+	u8 *p = (u8 *)j0;
+
+	memcpy(p, ctx->nonce, GCM_NONCE_SIZE);
+	memcpy(p + GCM_NONCE_SIZE, iv, GCM_RFC4106_IV_SIZE);
+	p[12] = 0x00;
+	p[13] = 0x00;
+	p[14] = 0x00;
+	p[15] = 0x01;
 }
 
 /*
  * Build J0 for generic gcm(aes): IV(12) || 0x00000001
  * (96-bit IV case per NIST SP 800-38D)
  */
-static void octeon_gcm_build_j0(const u8 *iv, u8 *j0)
+static void octeon_gcm_build_j0(const u8 *iv, u64 *j0)
 {
-	memcpy(j0, iv, GCM_FULL_IV_SIZE);
-	j0[12] = 0x00;
-	j0[13] = 0x00;
-	j0[14] = 0x00;
-	j0[15] = 0x01;
+	u8 *p = (u8 *)j0;
+
+	memcpy(p, iv, GCM_FULL_IV_SIZE);
+	p[12] = 0x00;
+	p[13] = 0x00;
+	p[14] = 0x00;
+	p[15] = 0x01;
 }
 
 /*
@@ -165,11 +168,10 @@ static void octeon_gcm_build_j0(const u8 *iv, u8 *j0)
  *
  * COP2 must be enabled with key loaded.
  */
-static void octeon_gcm_encrypt_counter(const u8 *counter, u8 *out)
+static void octeon_gcm_encrypt_counter(const u64 *counter, u8 *out)
 {
-	u64 block[2];
+	u64 block[2] = { counter[0], counter[1] };
 
-	memcpy(block, counter, GCM_BLOCK_SIZE);
 	octeon_aes_encrypt_block(block);
 	memcpy(out, block, GCM_BLOCK_SIZE);
 }
@@ -245,6 +247,30 @@ static void octeon_gcm_ghash_final(unsigned int aad_len,
 
 	/* Read final GHASH value */
 	octeon_gfm_read_result(tag_out);
+}
+
+
+/*
+ * AES-CTR encrypt/decrypt a buffer (CTR is its own inverse).
+ *
+ * Increments rctx->counter for each 16-byte block and XORs the AES keystream
+ * with the input. Handles partial final blocks.
+ *
+ * COP2 must be enabled with key loaded before calling.
+ */
+static void octeon_gcm_ctr_crypt(struct octeon_gcm_reqctx *rctx,
+				 const u8 *in, u8 *out, unsigned int len)
+{
+	unsigned int pos = 0, block_len, i;
+
+	while (pos < len) {
+		gcm_counter_inc(rctx->counter);
+		octeon_gcm_encrypt_counter(rctx->counter, rctx->keystream);
+		block_len = min_t(unsigned int, GCM_BLOCK_SIZE, len - pos);
+		for (i = 0; i < block_len; i++)
+			out[pos + i] = in[pos + i] ^ rctx->keystream[i];
+		pos += block_len;
+	}
 }
 
 
@@ -372,7 +398,6 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 	u8 tag_bytes[GCM_MAX_AUTH_SIZE];
 	/* Stack buffer for rfc4106 AAD: assoclen is 16 or 20 (validated below) */
 	u8 aad[20];
-	unsigned int i;
 
 	/* Validate assoclen: must be 16 (standard) or 20 (ESN). Per rfc4106,
 	 * assoclen = ESP_header(8) + explicit_IV(8), or + ESN(4) = 20.
@@ -384,7 +409,8 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 	octeon_rfc4106_build_j0(ctx, req->iv, rctx->j0);
 
 	/* Counter for CTR mode starts at J0 + 1 (J0 is reserved for tag) */
-	memcpy(rctx->counter, rctx->j0, GCM_BLOCK_SIZE);
+	rctx->counter[0] = rctx->j0[0];
+	rctx->counter[1] = rctx->j0[1];
 
 	/* --- Begin COP2 critical section --- */
 	cop2_flags = octeon_crypto_enable(&cop2_state);
@@ -435,26 +461,8 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 		scatterwalk_map_and_copy(pt_buf, req->src, assoclen,
 					 cryptlen, 0);
 
-		/* AES-CTR encrypt */
-		{
-			unsigned int pos = 0;
-			unsigned int block_len;
-
-			while (pos < cryptlen) {
-				gcm_counter_inc(rctx->counter);
-				octeon_gcm_encrypt_counter(rctx->counter,
-							   rctx->keystream);
-				block_len = min_t(unsigned int,
-						  GCM_BLOCK_SIZE,
-						  cryptlen - pos);
-				for (i = 0; i < block_len; i++)
-					ct_buf[pos + i] = pt_buf[pos + i] ^
-							  rctx->keystream[i];
-				pos += block_len;
-			}
-		}
-
-		/* GHASH the ciphertext */
+		/* AES-CTR encrypt, then GHASH the ciphertext */
+		octeon_gcm_ctr_crypt(rctx, pt_buf, ct_buf, cryptlen);
 		octeon_gcm_ghash_ct_block(ct_buf, cryptlen);
 
 		/* Write ciphertext to dst (skip AAD) */
@@ -510,7 +518,6 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	 * Kept alive past the COP2 section for the post-verify dst copy. */
 	u8 aad[20];
 	u8 *ct_buf = NULL, *pt_buf = NULL;
-	unsigned int i;
 	int ret;
 
 	/* Validate assoclen per rfc4106 contract (crypto/gcm.c:867) */
@@ -529,7 +536,8 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 
 	/* Build J0: nonce(4) || IV(8) || 0x00000001 */
 	octeon_rfc4106_build_j0(ctx, req->iv, rctx->j0);
-	memcpy(rctx->counter, rctx->j0, GCM_BLOCK_SIZE);
+	rctx->counter[0] = rctx->j0[0];
+	rctx->counter[1] = rctx->j0[1];
 
 	/* --- Begin COP2 critical section --- */
 	cop2_flags = octeon_crypto_enable(&cop2_state);
@@ -567,27 +575,9 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 		scatterwalk_map_and_copy(ct_buf, req->src, assoclen,
 					 ct_len, 0);
 
-		/* GHASH the ciphertext */
+		/* GHASH ciphertext, then AES-CTR decrypt */
 		octeon_gcm_ghash_ct_block(ct_buf, ct_len);
-
-		/* AES-CTR decrypt */
-		{
-			unsigned int pos = 0;
-			unsigned int block_len;
-
-			while (pos < ct_len) {
-				gcm_counter_inc(rctx->counter);
-				octeon_gcm_encrypt_counter(rctx->counter,
-							   rctx->keystream);
-				block_len = min_t(unsigned int,
-						  GCM_BLOCK_SIZE,
-						  ct_len - pos);
-				for (i = 0; i < block_len; i++)
-					pt_buf[pos + i] = ct_buf[pos + i] ^
-							  rctx->keystream[i];
-				pos += block_len;
-			}
-		}
+		octeon_gcm_ctr_crypt(rctx, ct_buf, pt_buf, ct_len);
 	}
 
 	/* Finalize GHASH: length block uses actual AAD bytes (not incl. IV) */
@@ -647,11 +637,11 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 	u64 tag[2];
 	u8 tag_bytes[GCM_MAX_AUTH_SIZE];
 	u8 *aad_buf = NULL;
-	unsigned int i;
 
 	/* Build J0: IV(12) || 0x00000001 */
 	octeon_gcm_build_j0(req->iv, rctx->j0);
-	memcpy(rctx->counter, rctx->j0, GCM_BLOCK_SIZE);
+	rctx->counter[0] = rctx->j0[0];
+	rctx->counter[1] = rctx->j0[1];
 
 	cop2_flags = octeon_crypto_enable(&cop2_state);
 	octeon_gcm_load_key(ctx);
@@ -694,25 +684,7 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 
 		scatterwalk_map_and_copy(pt_buf, req->src, assoclen,
 					 cryptlen, 0);
-
-		{
-			unsigned int pos = 0;
-			unsigned int block_len;
-
-			while (pos < cryptlen) {
-				gcm_counter_inc(rctx->counter);
-				octeon_gcm_encrypt_counter(rctx->counter,
-							   rctx->keystream);
-				block_len = min_t(unsigned int,
-						  GCM_BLOCK_SIZE,
-						  cryptlen - pos);
-				for (i = 0; i < block_len; i++)
-					ct_buf[pos + i] = pt_buf[pos + i] ^
-							  rctx->keystream[i];
-				pos += block_len;
-			}
-		}
-
+		octeon_gcm_ctr_crypt(rctx, pt_buf, ct_buf, cryptlen);
 		octeon_gcm_ghash_ct_block(ct_buf, cryptlen);
 		scatterwalk_map_and_copy(ct_buf, req->dst, assoclen,
 					 cryptlen, 1);
@@ -751,7 +723,6 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	u8 tag_received[GCM_MAX_AUTH_SIZE];
 	u8 *aad_buf = NULL;
 	u8 *ct_buf = NULL, *pt_buf = NULL;
-	unsigned int i;
 	int ret;
 
 	if (cryptlen < ctx->authsize)
@@ -764,7 +735,8 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 
 	/* Build J0: IV(12) || 0x00000001 */
 	octeon_gcm_build_j0(req->iv, rctx->j0);
-	memcpy(rctx->counter, rctx->j0, GCM_BLOCK_SIZE);
+	rctx->counter[0] = rctx->j0[0];
+	rctx->counter[1] = rctx->j0[1];
 
 	cop2_flags = octeon_crypto_enable(&cop2_state);
 	octeon_gcm_load_key(ctx);
@@ -799,24 +771,7 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 		scatterwalk_map_and_copy(ct_buf, req->src, assoclen,
 					 ct_len, 0);
 		octeon_gcm_ghash_ct_block(ct_buf, ct_len);
-
-		{
-			unsigned int pos = 0;
-			unsigned int block_len;
-
-			while (pos < ct_len) {
-				gcm_counter_inc(rctx->counter);
-				octeon_gcm_encrypt_counter(rctx->counter,
-							   rctx->keystream);
-				block_len = min_t(unsigned int,
-						  GCM_BLOCK_SIZE,
-						  ct_len - pos);
-				for (i = 0; i < block_len; i++)
-					pt_buf[pos + i] = ct_buf[pos + i] ^
-							  rctx->keystream[i];
-				pos += block_len;
-			}
-		}
+		octeon_gcm_ctr_crypt(rctx, ct_buf, pt_buf, ct_len);
 	}
 
 	octeon_gcm_ghash_final(assoclen, ct_len, tag_calc);
