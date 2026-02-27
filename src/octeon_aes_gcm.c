@@ -148,9 +148,9 @@ static void octeon_rfc4106_build_j0(const struct octeon_gcm_ctx *ctx,
  * Build J0 for generic gcm(aes): IV(12) || 0x00000001
  * (96-bit IV case per NIST SP 800-38D)
  */
-static void octeon_gcm_build_j0(const u8 *iv, unsigned int ivsize, u8 *j0)
+static void octeon_gcm_build_j0(const u8 *iv, u8 *j0)
 {
-	memcpy(j0, iv, ivsize);
+	memcpy(j0, iv, GCM_FULL_IV_SIZE);
 	j0[12] = 0x00;
 	j0[13] = 0x00;
 	j0[14] = 0x00;
@@ -473,8 +473,7 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 
 	/* Compute final tag: GHASH_result XOR AES_K(J0) */
 	memcpy(tag_bytes, tag, GCM_BLOCK_SIZE);
-	for (i = 0; i < GCM_BLOCK_SIZE; i++)
-		tag_bytes[i] ^= rctx->tag_enc[i];
+	crypto_xor(tag_bytes, rctx->tag_enc, GCM_BLOCK_SIZE);
 
 	/* Append authentication tag to output */
 	scatterwalk_map_and_copy(tag_bytes, req->dst,
@@ -599,8 +598,7 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 
 	/* Compute expected tag */
 	memcpy(tag_computed, tag_calc, GCM_BLOCK_SIZE);
-	for (i = 0; i < GCM_BLOCK_SIZE; i++)
-		tag_computed[i] ^= rctx->tag_enc[i];
+	crypto_xor(tag_computed, rctx->tag_enc, GCM_BLOCK_SIZE);
 
 	/* Constant-time tag comparison */
 	ret = crypto_memneq(tag_computed, tag_received, ctx->authsize);
@@ -652,7 +650,7 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 	unsigned int i;
 
 	/* Build J0: IV(12) || 0x00000001 */
-	octeon_gcm_build_j0(req->iv, GCM_FULL_IV_SIZE, rctx->j0);
+	octeon_gcm_build_j0(req->iv, rctx->j0);
 	memcpy(rctx->counter, rctx->j0, GCM_BLOCK_SIZE);
 
 	cop2_flags = octeon_crypto_enable(&cop2_state);
@@ -727,8 +725,7 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 	octeon_crypto_disable(&cop2_state, cop2_flags);
 
 	memcpy(tag_bytes, tag, GCM_BLOCK_SIZE);
-	for (i = 0; i < GCM_BLOCK_SIZE; i++)
-		tag_bytes[i] ^= rctx->tag_enc[i];
+	crypto_xor(tag_bytes, rctx->tag_enc, GCM_BLOCK_SIZE);
 
 	scatterwalk_map_and_copy(tag_bytes, req->dst,
 				 assoclen + cryptlen, ctx->authsize, 1);
@@ -766,7 +763,7 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 				 assoclen + ct_len, ctx->authsize, 0);
 
 	/* Build J0: IV(12) || 0x00000001 */
-	octeon_gcm_build_j0(req->iv, GCM_FULL_IV_SIZE, rctx->j0);
+	octeon_gcm_build_j0(req->iv, rctx->j0);
 	memcpy(rctx->counter, rctx->j0, GCM_BLOCK_SIZE);
 
 	cop2_flags = octeon_crypto_enable(&cop2_state);
@@ -826,8 +823,7 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	octeon_crypto_disable(&cop2_state, cop2_flags);
 
 	memcpy(tag_computed, tag_calc, GCM_BLOCK_SIZE);
-	for (i = 0; i < GCM_BLOCK_SIZE; i++)
-		tag_computed[i] ^= rctx->tag_enc[i];
+	crypto_xor(tag_computed, rctx->tag_enc, GCM_BLOCK_SIZE);
 
 	ret = crypto_memneq(tag_computed, tag_received, ctx->authsize);
 	if (ret) {

@@ -22,6 +22,7 @@
 #define _OCTEON_COP2_H
 
 #include <linux/types.h>
+#include <asm/unaligned.h>
 
 /* =========================================================================
  * COP2 Register Map - AES Engine
@@ -279,17 +280,7 @@ static inline void octeon_gfm_read_result(u64 *result)
  */
 static inline void gcm_counter_inc(u8 *ctr_block)
 {
-	u32 c;
-
-	c = ((u32)ctr_block[12] << 24) |
-	    ((u32)ctr_block[13] << 16) |
-	    ((u32)ctr_block[14] <<  8) |
-	    ((u32)ctr_block[15]);
-	c++;
-	ctr_block[12] = (u8)(c >> 24);
-	ctr_block[13] = (u8)(c >> 16);
-	ctr_block[14] = (u8)(c >>  8);
-	ctr_block[15] = (u8)(c);
+	put_unaligned_be32(get_unaligned_be32(ctr_block + 12) + 1, ctr_block + 12);
 }
 
 #endif /* _OCTEON_COP2_H */
