@@ -217,15 +217,15 @@ static inline void octeon_aes_encrypt_block(u64 *block)
  * ========================================================================= */
 
 /*
- * Initialize the GFM engine for GHASH computation.
+ * Load the GFM reduction polynomial and hash subkey H into hardware.
  *
- * Sets the GCM reduction polynomial and the hash subkey H.
- * Clears the accumulator to zero.
+ * Only needed on a per-CPU cache miss (transform change). Kept separate
+ * from accumulator clearing to enable per-CPU key caching.
  *
  * @h: pointer to 128-bit hash subkey H = AES_K(0^128)
  *     h[0] = bits [127:64], h[1] = bits [63:0]
  */
-static inline void octeon_gfm_init(const u64 *h)
+static inline void octeon_gfm_load_key(const u64 *h)
 {
 	/* Set reduction polynomial for GCM */
 	OCTEON_MT_COP2(GCM_POLY_HI, 0x025E);  /* GFM_POLY = 0xe100 */
@@ -233,8 +233,16 @@ static inline void octeon_gfm_init(const u64 *h)
 	/* Set multiplier H — non-reflected interface, H loaded directly from AES result */
 	OCTEON_MT_COP2(h[0], 0x0258);  /* GFM_MUL0: H[127:64] */
 	OCTEON_MT_COP2(h[1], 0x0259);  /* GFM_MUL1: H[63:0]   */
+}
 
-	/* Clear accumulator */
+/*
+ * Clear the GFM accumulator to zero.
+ *
+ * Must be called before each new GHASH computation, even on a per-CPU
+ * cache hit, since the accumulator holds state from the previous packet.
+ */
+static inline void octeon_gfm_clear_accum(void)
+{
 	OCTEON_MT_COP2(0ULL, 0x025A);  /* GFM_RESINP0 = 0 */
 	OCTEON_MT_COP2(0ULL, 0x025B);  /* GFM_RESINP1 = 0 */
 }

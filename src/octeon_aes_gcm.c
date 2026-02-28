@@ -31,6 +31,8 @@
 #include <linux/scatterlist.h>
 #include <linux/string.h>
 #include <linux/err.h>
+#include <linux/percpu.h>
+#include <linux/smp.h>
 #include <crypto/aead.h>
 #include <crypto/aes.h>
 #include <crypto/internal/aead.h>
@@ -55,6 +57,11 @@
 
 /* Algorithm priority — higher than software (~100-300) */
 #define OCTEON_GCM_PRIORITY 500
+
+/* Stack buffer threshold for generic gcm(aes) AAD.
+ * Covers TLS 1.2 (13 B), TLS 1.3 (5 B), QUIC, and similar callers.
+ * Larger AAD falls back to kmalloc. */
+#define GCM_SMALL_AAD_SIZE  64
 
 /* Inline scratch buffer size — covers standard 1500-byte MTU plus ESP overhead.
  * Packets at or below this size need no heap allocation for pt_buf/ct_buf. */
@@ -87,7 +94,6 @@ struct octeon_gcm_reqctx {
 	u64 j0[2];                        /* Initial counter block (u64 for COP2 AES input)  */
 	u64 counter[2];                   /* Running CTR counter (u64 for COP2 AES input)    */
 	u8 tag_enc[GCM_BLOCK_SIZE];       /* AES_K(J0) for final tag XOR */
-	u8 keystream[GCM_BLOCK_SIZE];     /* CTR keystream block         */
 	/*
 	 * Inline scratch space for ct_buf and pt_buf.
 	 * [0 .. OCTEON_GCM_INLINE_BUF_SIZE-1]      → ct_buf
@@ -97,6 +103,20 @@ struct octeon_gcm_reqctx {
 	u8 inline_buf[OCTEON_GCM_INLINE_BUF_SIZE * 2];
 };
 
+
+/*
+ * Per-CPU transform cache.
+ *
+ * Tracks which octeon_gcm_ctx was last loaded into this CPU's COP2 registers.
+ * On a cache hit (last_ctx == ctx), the AES key, GFM polynomial, and GHASH
+ * subkey H are already in hardware — skip the 8 dmtc2 reload writes.
+ * The GFM accumulator is always cleared regardless (it holds per-packet state).
+ *
+ * Hardware retains COP2 register state between enable/disable cycles as long
+ * as no other COP2 user runs on this CPU (verified: octeon_crypto_enable only
+ * sets ST0_CU2; it does not restore registers).
+ */
+static DEFINE_PER_CPU(const struct octeon_gcm_ctx *, octeon_gcm_last_ctx);
 
 /* =========================================================================
  * Low-Level GCM Operations (COP2-backed)
@@ -215,27 +235,174 @@ static void octeon_gcm_ghash_aad(const u8 *aad, unsigned int aad_len)
 }
 
 /*
- * Process ciphertext through GHASH, one block at a time.
+ * Single-pass AES-CTR encrypt + GHASH ciphertext.
  *
- * Called incrementally as ciphertext is produced (encrypt) or
- * before decryption (decrypt). Handles the final partial block.
+ * Interleaves GFM for ciphertext block N-1 with AES keystream generation
+ * for block N, hiding AES ECB latency behind GFM computation.
+ * Both engines are independent COP2 hardware blocks that run concurrently.
+ *
+ *   Iteration N:  AES_trigger(N), GFM_trigger(ct[N-1]), AES_read(N), XOR → ct[N]
+ *
+ * On return, the GHASH accumulator includes all ct bytes (full blocks
+ * plus a zero-padded partial block if len % 16 != 0).
+ * Caller finalizes GHASH with octeon_gcm_ghash_final().
+ *
+ * COP2 must be enabled with key loaded, H loaded, accumulator cleared.
  */
-static void octeon_gcm_ghash_ct_block(const u8 *data, unsigned int len)
+static void octeon_gcm_ctr_encrypt_ghash(struct octeon_gcm_reqctx *rctx,
+					 const u8 *pt, u8 *ct,
+					 unsigned int len)
 {
-	u64 block[2];
-	unsigned int i;
-	unsigned int full_blocks = len / GCM_BLOCK_SIZE;
+	unsigned int n_full = len / GCM_BLOCK_SIZE;
 	unsigned int remainder = len % GCM_BLOCK_SIZE;
+	unsigned int i;
+	u64 ks[2];
+	u64 pt_blk[2], ct_blk[2];
+	bool has_prev_ct = false;
 
-	for (i = 0; i < full_blocks; i++) {
-		memcpy(block, data + i * GCM_BLOCK_SIZE, GCM_BLOCK_SIZE);
-		octeon_gfm_xormul(block);
+	for (i = 0; i < n_full; i++) {
+		/* Issue AES for counter block i (non-blocking trigger) */
+		gcm_counter_inc(rctx->counter);
+		OCTEON_MT_COP2(rctx->counter[0], 0x010A);
+		OCTEON_MT_COP2(rctx->counter[1], 0x310B);
+
+		/*
+		 * While AES block i is computing, issue GFM for ct[i-1].
+		 * GFM engine is independent of AES — the dmtc2 to 0x425D
+		 * is non-blocking (AES and GFM run in parallel).
+		 */
+		if (has_prev_ct) {
+			OCTEON_MT_COP2(ct_blk[0], 0x025C);
+			OCTEON_MT_COP2(ct_blk[1], 0x425D);
+		}
+
+		/* Read AES result — stalls until AES done (GFM ran in parallel) */
+		OCTEON_MF_COP2(ks[0], 0x0100);
+		OCTEON_MF_COP2(ks[1], 0x0101);
+
+		memcpy(pt_blk, pt + i * GCM_BLOCK_SIZE, GCM_BLOCK_SIZE);
+		ct_blk[0] = pt_blk[0] ^ ks[0];
+		ct_blk[1] = pt_blk[1] ^ ks[1];
+		memcpy(ct + i * GCM_BLOCK_SIZE, ct_blk, GCM_BLOCK_SIZE);
+		has_prev_ct = true;
 	}
 
 	if (remainder) {
-		memset(block, 0, GCM_BLOCK_SIZE);
-		memcpy(block, data + full_blocks * GCM_BLOCK_SIZE, remainder);
-		octeon_gfm_xormul(block);
+		u8 partial[GCM_BLOCK_SIZE] = { 0 };
+		unsigned int j;
+
+		/* Issue AES for partial counter block (non-blocking) */
+		gcm_counter_inc(rctx->counter);
+		OCTEON_MT_COP2(rctx->counter[0], 0x010A);
+		OCTEON_MT_COP2(rctx->counter[1], 0x310B);
+
+		/* GFM for last full block while AES partial is computing */
+		if (has_prev_ct) {
+			OCTEON_MT_COP2(ct_blk[0], 0x025C);
+			OCTEON_MT_COP2(ct_blk[1], 0x425D);
+		}
+
+		OCTEON_MF_COP2(ks[0], 0x0100);
+		OCTEON_MF_COP2(ks[1], 0x0101);
+
+		/* XOR keystream; keep tail bytes zero for GCM padding */
+		memcpy(partial, pt + n_full * GCM_BLOCK_SIZE, remainder);
+		for (j = 0; j < remainder; j++)
+			partial[j] ^= ((u8 *)ks)[j];
+		memcpy(ct + n_full * GCM_BLOCK_SIZE, partial, remainder);
+
+		/* GHASH the zero-padded partial ciphertext block */
+		memcpy(ct_blk, partial, GCM_BLOCK_SIZE);
+		OCTEON_MT_COP2(ct_blk[0], 0x025C);
+		OCTEON_MT_COP2(ct_blk[1], 0x425D);
+	} else if (has_prev_ct) {
+		/* No partial block: GFM the last full ciphertext block */
+		OCTEON_MT_COP2(ct_blk[0], 0x025C);
+		OCTEON_MT_COP2(ct_blk[1], 0x425D);
+	}
+}
+
+/*
+ * Single-pass GHASH ciphertext + AES-CTR decrypt.
+ *
+ * Interleaves GFM for ciphertext block N with AES keystream generation for
+ * block N+1. For decrypt, the ciphertext is already in memory, so GFM can
+ * start immediately — we don't need the AES result to feed GFM.
+ *
+ *   Prolog:       AES_trigger(0)
+ *   Iteration i:  GFM_trigger(ct[i]),  AES_read(i),  XOR → pt[i],  AES_trigger(i+1)
+ *
+ * AES_trigger(i+1) fires after AES_read(i), overlapping with the XOR,
+ * memcpy, and the next iteration's GFM_trigger.  By the time AES_read(i+1)
+ * is reached, AES(i+1) has had a significant head start.
+ *
+ * COP2 must be enabled with key loaded, H loaded, accumulator cleared.
+ */
+static void octeon_gcm_ghash_ctr_decrypt(struct octeon_gcm_reqctx *rctx,
+					 const u8 *ct, u8 *pt,
+					 unsigned int len)
+{
+	unsigned int n_full = len / GCM_BLOCK_SIZE;
+	unsigned int remainder = len % GCM_BLOCK_SIZE;
+	unsigned int i;
+	u64 ks[2];
+	u64 ct_blk[2], pt_blk[2];
+
+	if (n_full > 0) {
+		/* Prolog: issue AES for block 0 before the loop */
+		gcm_counter_inc(rctx->counter);
+		OCTEON_MT_COP2(rctx->counter[0], 0x010A);
+		OCTEON_MT_COP2(rctx->counter[1], 0x310B);
+
+		for (i = 0; i < n_full; i++) {
+			/*
+			 * Issue GFM for ct[i] while AES(i) computes.
+			 * ct is already in memory — no AES result needed.
+			 */
+			memcpy(ct_blk, ct + i * GCM_BLOCK_SIZE, GCM_BLOCK_SIZE);
+			OCTEON_MT_COP2(ct_blk[0], 0x025C);
+			OCTEON_MT_COP2(ct_blk[1], 0x425D);
+
+			/* Read AES block i result — stalls until done */
+			OCTEON_MF_COP2(ks[0], 0x0100);
+			OCTEON_MF_COP2(ks[1], 0x0101);
+
+			pt_blk[0] = ct_blk[0] ^ ks[0];
+			pt_blk[1] = ct_blk[1] ^ ks[1];
+			memcpy(pt + i * GCM_BLOCK_SIZE, pt_blk, GCM_BLOCK_SIZE);
+
+			/* Issue AES for block i+1 after read — overlaps with next GFM */
+			if (i < n_full - 1) {
+				gcm_counter_inc(rctx->counter);
+				OCTEON_MT_COP2(rctx->counter[0], 0x010A);
+				OCTEON_MT_COP2(rctx->counter[1], 0x310B);
+			}
+		}
+	}
+
+	if (remainder) {
+		u8 partial[GCM_BLOCK_SIZE] = { 0 };
+		u64 partial_u64[2];
+		unsigned int j;
+
+		memcpy(partial, ct + n_full * GCM_BLOCK_SIZE, remainder);
+		memcpy(partial_u64, partial, GCM_BLOCK_SIZE);
+
+		/* Issue AES for partial counter block */
+		gcm_counter_inc(rctx->counter);
+		OCTEON_MT_COP2(rctx->counter[0], 0x010A);
+		OCTEON_MT_COP2(rctx->counter[1], 0x310B);
+
+		/* GFM the zero-padded partial ciphertext while AES computes */
+		OCTEON_MT_COP2(partial_u64[0], 0x025C);
+		OCTEON_MT_COP2(partial_u64[1], 0x425D);
+
+		OCTEON_MF_COP2(ks[0], 0x0100);
+		OCTEON_MF_COP2(ks[1], 0x0101);
+
+		for (j = 0; j < remainder; j++)
+			partial[j] ^= ((u8 *)ks)[j];
+		memcpy(pt + n_full * GCM_BLOCK_SIZE, partial, remainder);
 	}
 }
 
@@ -260,29 +427,6 @@ static void octeon_gcm_ghash_final(unsigned int aad_len,
 	octeon_gfm_read_result(tag_out);
 }
 
-
-/*
- * AES-CTR encrypt/decrypt a buffer (CTR is its own inverse).
- *
- * Increments rctx->counter for each 16-byte block and XORs the AES keystream
- * with the input. Handles partial final blocks.
- *
- * COP2 must be enabled with key loaded before calling.
- */
-static void octeon_gcm_ctr_crypt(struct octeon_gcm_reqctx *rctx,
-				 const u8 *in, u8 *out, unsigned int len)
-{
-	unsigned int pos = 0, block_len, i;
-
-	while (pos < len) {
-		gcm_counter_inc(rctx->counter);
-		octeon_gcm_encrypt_counter(rctx->counter, rctx->keystream);
-		block_len = min_t(unsigned int, GCM_BLOCK_SIZE, len - pos);
-		for (i = 0; i < block_len; i++)
-			out[pos + i] = in[pos + i] ^ rctx->keystream[i];
-		pos += block_len;
-	}
-}
 
 
 /*
@@ -455,14 +599,18 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 	/* --- Begin COP2 critical section --- */
 	cop2_flags = octeon_crypto_enable(&cop2_state);
 
-	/* Load AES key into COP2 */
-	octeon_gcm_load_key(ctx);
+	/* Skip key+H reload if hardware still holds this transform's state */
+	if (__this_cpu_read(octeon_gcm_last_ctx) != ctx) {
+		octeon_gcm_load_key(ctx);
+		octeon_gfm_load_key(ctx->hash_subkey);
+		__this_cpu_write(octeon_gcm_last_ctx, ctx);
+	}
 
 	/* Encrypt J0 for final tag computation: tag_enc = AES_K(J0) */
 	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
 
-	/* Initialize GHASH engine with precomputed H */
-	octeon_gfm_init(ctx->hash_subkey);
+	/* Clear GHASH accumulator (required before each new packet) */
+	octeon_gfm_clear_accum();
 
 	/*
 	 * GHASH: Process AAD (ESP header only, not the explicit IV).
@@ -503,9 +651,8 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 		scatterwalk_map_and_copy(pt_buf, req->src, assoclen,
 					 cryptlen, 0);
 
-		/* AES-CTR encrypt, then GHASH the ciphertext */
-		octeon_gcm_ctr_crypt(rctx, pt_buf, ct_buf, cryptlen);
-		octeon_gcm_ghash_ct_block(ct_buf, cryptlen);
+		/* AES-CTR encrypt + GHASH ciphertext (single-pass pipelined) */
+		octeon_gcm_ctr_encrypt_ghash(rctx, pt_buf, ct_buf, cryptlen);
 
 		/* Write ciphertext to dst (skip AAD) */
 		scatterwalk_map_and_copy(ct_buf, req->dst, assoclen,
@@ -585,13 +732,18 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 	/* --- Begin COP2 critical section --- */
 	cop2_flags = octeon_crypto_enable(&cop2_state);
 
-	octeon_gcm_load_key(ctx);
+	/* Skip key+H reload if hardware still holds this transform's state */
+	if (__this_cpu_read(octeon_gcm_last_ctx) != ctx) {
+		octeon_gcm_load_key(ctx);
+		octeon_gfm_load_key(ctx->hash_subkey);
+		__this_cpu_write(octeon_gcm_last_ctx, ctx);
+	}
 
 	/* Encrypt J0 for tag computation */
 	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
 
-	/* Initialize GHASH */
-	octeon_gfm_init(ctx->hash_subkey);
+	/* Clear GHASH accumulator (required before each new packet) */
+	octeon_gfm_clear_accum();
 
 	/*
 	 * GHASH: Process AAD (ESP header only, not the explicit IV).
@@ -619,9 +771,8 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 		scatterwalk_map_and_copy(ct_buf, req->src, assoclen,
 					 ct_len, 0);
 
-		/* GHASH ciphertext, then AES-CTR decrypt */
-		octeon_gcm_ghash_ct_block(ct_buf, ct_len);
-		octeon_gcm_ctr_crypt(rctx, ct_buf, pt_buf, ct_len);
+		/* GHASH ciphertext + AES-CTR decrypt (single-pass pipelined) */
+		octeon_gcm_ghash_ctr_decrypt(rctx, ct_buf, pt_buf, ct_len);
 	}
 
 	/* Finalize GHASH: length block uses actual AAD bytes (not incl. IV) */
@@ -680,7 +831,6 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 	unsigned int cryptlen = req->cryptlen;
 	u64 tag[2];
 	u8 tag_bytes[GCM_MAX_AUTH_SIZE];
-	u8 *aad_buf = NULL;
 
 	/* Build J0: IV(12) || 0x00000001 */
 	octeon_gcm_build_j0(req->iv, rctx->j0);
@@ -688,30 +838,38 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 	rctx->counter[1] = rctx->j0[1];
 
 	cop2_flags = octeon_crypto_enable(&cop2_state);
-	octeon_gcm_load_key(ctx);
-	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
-	octeon_gfm_init(ctx->hash_subkey);
 
-	if (assoclen > 0) {
-		aad_buf = kmalloc(assoclen, GFP_ATOMIC);
-		if (!aad_buf) {
-			octeon_crypto_disable(&cop2_state, cop2_flags);
-			return -ENOMEM;
-		}
-		scatterwalk_map_and_copy(aad_buf, req->src, 0, assoclen, 0);
-		octeon_gcm_ghash_aad(aad_buf, assoclen);
-		kfree(aad_buf);
+	/* Skip key+H reload if hardware still holds this transform's state */
+	if (__this_cpu_read(octeon_gcm_last_ctx) != ctx) {
+		octeon_gcm_load_key(ctx);
+		octeon_gfm_load_key(ctx->hash_subkey);
+		__this_cpu_write(octeon_gcm_last_ctx, ctx);
 	}
 
-	if (req->src != req->dst && assoclen > 0) {
-		u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
-		if (!tmp) {
-			octeon_crypto_disable(&cop2_state, cop2_flags);
-			return -ENOMEM;
+	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
+	octeon_gfm_clear_accum();
+
+	if (assoclen > 0) {
+		u8 aad_local[GCM_SMALL_AAD_SIZE];
+		u8 *aad_p;
+		bool aad_heap = false;
+
+		if (assoclen <= GCM_SMALL_AAD_SIZE) {
+			aad_p = aad_local;
+		} else {
+			aad_p = kmalloc(assoclen, GFP_ATOMIC);
+			if (!aad_p) {
+				octeon_crypto_disable(&cop2_state, cop2_flags);
+				return -ENOMEM;
+			}
+			aad_heap = true;
 		}
-		scatterwalk_map_and_copy(tmp, req->src, 0, assoclen, 0);
-		scatterwalk_map_and_copy(tmp, req->dst, 0, assoclen, 1);
-		kfree(tmp);
+		scatterwalk_map_and_copy(aad_p, req->src, 0, assoclen, 0);
+		octeon_gcm_ghash_aad(aad_p, assoclen);
+		if (req->src != req->dst)
+			scatterwalk_map_and_copy(aad_p, req->dst, 0, assoclen, 1);
+		if (aad_heap)
+			kfree(aad_p);
 	}
 
 	if (cryptlen > 0) {
@@ -730,8 +888,7 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 
 		scatterwalk_map_and_copy(pt_buf, req->src, assoclen,
 					 cryptlen, 0);
-		octeon_gcm_ctr_crypt(rctx, pt_buf, ct_buf, cryptlen);
-		octeon_gcm_ghash_ct_block(ct_buf, cryptlen);
+		octeon_gcm_ctr_encrypt_ghash(rctx, pt_buf, ct_buf, cryptlen);
 		scatterwalk_map_and_copy(ct_buf, req->dst, assoclen,
 					 cryptlen, 1);
 
@@ -767,7 +924,9 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	u64 tag_calc[2];
 	u8 tag_computed[GCM_MAX_AUTH_SIZE];
 	u8 tag_received[GCM_MAX_AUTH_SIZE];
-	u8 *aad_buf = NULL;
+	u8 aad_local[GCM_SMALL_AAD_SIZE];
+	u8 *aad_p = NULL;
+	bool aad_heap = false;
 	u8 *ct_buf = NULL, *pt_buf = NULL;
 	bool ct_heap = false, pt_heap = false;
 	int ret;
@@ -786,19 +945,31 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	rctx->counter[1] = rctx->j0[1];
 
 	cop2_flags = octeon_crypto_enable(&cop2_state);
-	octeon_gcm_load_key(ctx);
+
+	/* Skip key+H reload if hardware still holds this transform's state */
+	if (__this_cpu_read(octeon_gcm_last_ctx) != ctx) {
+		octeon_gcm_load_key(ctx);
+		octeon_gfm_load_key(ctx->hash_subkey);
+		__this_cpu_write(octeon_gcm_last_ctx, ctx);
+	}
+
 	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
-	octeon_gfm_init(ctx->hash_subkey);
+	octeon_gfm_clear_accum();
 
 	if (assoclen > 0) {
-		aad_buf = kmalloc(assoclen, GFP_ATOMIC);
-		if (!aad_buf) {
-			octeon_crypto_disable(&cop2_state, cop2_flags);
-			return -ENOMEM;
+		if (assoclen <= GCM_SMALL_AAD_SIZE) {
+			aad_p = aad_local;
+		} else {
+			aad_p = kmalloc(assoclen, GFP_ATOMIC);
+			if (!aad_p) {
+				octeon_crypto_disable(&cop2_state, cop2_flags);
+				return -ENOMEM;
+			}
+			aad_heap = true;
 		}
-		scatterwalk_map_and_copy(aad_buf, req->src, 0, assoclen, 0);
-		octeon_gcm_ghash_aad(aad_buf, assoclen);
-		kfree(aad_buf);
+		scatterwalk_map_and_copy(aad_p, req->src, 0, assoclen, 0);
+		octeon_gcm_ghash_aad(aad_p, assoclen);
+		/* Keep aad_p alive — reused for dst copy after tag verify. */
 	}
 
 	/*
@@ -812,14 +983,15 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 		if (!ct_buf || !pt_buf) {
 			gcm_buf_put(ct_buf, ct_heap);
 			gcm_buf_put(pt_buf, pt_heap);
+			if (aad_heap)
+				kfree(aad_p);
 			octeon_crypto_disable(&cop2_state, cop2_flags);
 			return -ENOMEM;
 		}
 
 		scatterwalk_map_and_copy(ct_buf, req->src, assoclen,
 					 ct_len, 0);
-		octeon_gcm_ghash_ct_block(ct_buf, ct_len);
-		octeon_gcm_ctr_crypt(rctx, ct_buf, pt_buf, ct_len);
+		octeon_gcm_ghash_ctr_decrypt(rctx, ct_buf, pt_buf, ct_len);
 	}
 
 	octeon_gcm_ghash_final(assoclen, ct_len, tag_calc);
@@ -834,6 +1006,8 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 		 * Authentication failed. dst was never written — no
 		 * unauthenticated plaintext is visible to the caller.
 		 */
+		if (aad_heap)
+			kfree(aad_p);
 		gcm_buf_put(ct_buf, ct_heap);
 		gcm_buf_put(pt_buf, pt_heap);
 		return -EBADMSG;
@@ -843,18 +1017,13 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 	 * Tag verified. Now safe to write output to dst.
 	 * AAD copy is outside the ct_len guard so it always runs
 	 * when src != dst, regardless of payload length.
+	 * Reuse aad_p (read earlier for GHASH) — no second src read needed.
 	 */
-	if (req->src != req->dst && assoclen > 0) {
-		u8 *tmp = kmalloc(assoclen, GFP_ATOMIC);
-		if (!tmp) {
-			gcm_buf_put(ct_buf, ct_heap);
-			gcm_buf_put(pt_buf, pt_heap);
-			return -ENOMEM;
-		}
-		scatterwalk_map_and_copy(tmp, req->src, 0, assoclen, 0);
-		scatterwalk_map_and_copy(tmp, req->dst, 0, assoclen, 1);
-		kfree(tmp);
-	}
+	if (req->src != req->dst && aad_p)
+		scatterwalk_map_and_copy(aad_p, req->dst, 0, assoclen, 1);
+
+	if (aad_heap)
+		kfree(aad_p);
 
 	if (ct_len > 0) {
 		scatterwalk_map_and_copy(pt_buf, req->dst, assoclen,
@@ -966,8 +1135,19 @@ static int __init octeon_gcm_mod_init(void)
 	return 0;
 }
 
+static void octeon_gcm_invalidate_cpu_cache(void *unused)
+{
+	__this_cpu_write(octeon_gcm_last_ctx, NULL);
+}
+
 static void __exit octeon_gcm_mod_exit(void)
 {
+	/*
+	 * Null out per-CPU last_ctx on all cores before unregistering.
+	 * Prevents a dangling pointer to freed ctx memory if a concurrent
+	 * packet were to arrive between unregister and module teardown.
+	 */
+	on_each_cpu(octeon_gcm_invalidate_cpu_cache, NULL, 1);
 	if (gcm_generic_registered)
 		crypto_unregister_aead(&octeon_gcm_generic_alg);
 	crypto_unregister_aead(&octeon_gcm_alg);
