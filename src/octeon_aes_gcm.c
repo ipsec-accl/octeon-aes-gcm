@@ -192,22 +192,6 @@ static void octeon_gcm_build_j0(const u8 *iv, u64 *j0)
 }
 
 /*
- * Encrypt a single counter block to produce keystream.
- *
- * @counter: 16-byte counter block (not modified)
- * @out:     16-byte keystream output
- *
- * COP2 must be enabled with key loaded.
- */
-static void octeon_gcm_encrypt_counter(const u64 *counter, u8 *out)
-{
-	u64 block[2] = { counter[0], counter[1] };
-
-	octeon_aes_encrypt_block(block);
-	memcpy(out, block, GCM_BLOCK_SIZE);
-}
-
-/*
  * Process AAD (Associated Authenticated Data) through GHASH.
  *
  * Handles padding to 16-byte boundary as required by GCM.
@@ -257,34 +241,44 @@ static void octeon_gcm_ctr_encrypt_ghash(struct octeon_gcm_reqctx *rctx,
 	unsigned int remainder = len % GCM_BLOCK_SIZE;
 	unsigned int i;
 	u64 ks[2];
-	u64 pt_blk[2], ct_blk[2];
-	bool has_prev_ct = false;
+	u64 ct_blk[2];
 
-	for (i = 0; i < n_full; i++) {
-		/* Issue AES for counter block i (non-blocking trigger) */
+	if (n_full > 0) {
+		/*
+		 * Iteration 0: peeled — no prior ciphertext block to GFM.
+		 * Direct u64 cast avoids an intermediate pt_blk[] copy.
+		 */
 		gcm_counter_inc(rctx->counter);
 		OCTEON_MT_COP2(rctx->counter[0], 0x010A);
 		OCTEON_MT_COP2(rctx->counter[1], 0x310B);
 
-		/*
-		 * While AES block i is computing, issue GFM for ct[i-1].
-		 * GFM engine is independent of AES — the dmtc2 to 0x425D
-		 * is non-blocking (AES and GFM run in parallel).
-		 */
-		if (has_prev_ct) {
-			OCTEON_MT_COP2(ct_blk[0], 0x025C);
-			OCTEON_MT_COP2(ct_blk[1], 0x425D);
-		}
-
-		/* Read AES result — stalls until AES done (GFM ran in parallel) */
 		OCTEON_MF_COP2(ks[0], 0x0100);
 		OCTEON_MF_COP2(ks[1], 0x0101);
 
-		memcpy(pt_blk, pt + i * GCM_BLOCK_SIZE, GCM_BLOCK_SIZE);
-		ct_blk[0] = pt_blk[0] ^ ks[0];
-		ct_blk[1] = pt_blk[1] ^ ks[1];
-		memcpy(ct + i * GCM_BLOCK_SIZE, ct_blk, GCM_BLOCK_SIZE);
-		has_prev_ct = true;
+		ct_blk[0] = ((const u64 *)pt)[0] ^ ks[0];
+		ct_blk[1] = ((const u64 *)pt)[1] ^ ks[1];
+		memcpy(ct, ct_blk, GCM_BLOCK_SIZE);
+
+		/* Iterations 1..n_full-1: branch-free hot path */
+		for (i = 1; i < n_full; i++) {
+			gcm_counter_inc(rctx->counter);
+			OCTEON_MT_COP2(rctx->counter[0], 0x010A);
+			OCTEON_MT_COP2(rctx->counter[1], 0x310B);
+
+			/*
+			 * GFM ct[i-1] while AES(i) computes.
+			 * Both engines are independent and run in parallel.
+			 */
+			OCTEON_MT_COP2(ct_blk[0], 0x025C);
+			OCTEON_MT_COP2(ct_blk[1], 0x425D);
+
+			OCTEON_MF_COP2(ks[0], 0x0100);
+			OCTEON_MF_COP2(ks[1], 0x0101);
+
+			ct_blk[0] = ((const u64 *)(pt + i * GCM_BLOCK_SIZE))[0] ^ ks[0];
+			ct_blk[1] = ((const u64 *)(pt + i * GCM_BLOCK_SIZE))[1] ^ ks[1];
+			memcpy(ct + i * GCM_BLOCK_SIZE, ct_blk, GCM_BLOCK_SIZE);
+		}
 	}
 
 	if (remainder) {
@@ -296,8 +290,8 @@ static void octeon_gcm_ctr_encrypt_ghash(struct octeon_gcm_reqctx *rctx,
 		OCTEON_MT_COP2(rctx->counter[0], 0x010A);
 		OCTEON_MT_COP2(rctx->counter[1], 0x310B);
 
-		/* GFM for last full block while AES partial is computing */
-		if (has_prev_ct) {
+		/* GFM last full block while AES partial is computing */
+		if (n_full > 0) {
 			OCTEON_MT_COP2(ct_blk[0], 0x025C);
 			OCTEON_MT_COP2(ct_blk[1], 0x425D);
 		}
@@ -315,7 +309,7 @@ static void octeon_gcm_ctr_encrypt_ghash(struct octeon_gcm_reqctx *rctx,
 		memcpy(ct_blk, partial, GCM_BLOCK_SIZE);
 		OCTEON_MT_COP2(ct_blk[0], 0x025C);
 		OCTEON_MT_COP2(ct_blk[1], 0x425D);
-	} else if (has_prev_ct) {
+	} else if (n_full > 0) {
 		/* No partial block: GFM the last full ciphertext block */
 		OCTEON_MT_COP2(ct_blk[0], 0x025C);
 		OCTEON_MT_COP2(ct_blk[1], 0x425D);
@@ -371,8 +365,12 @@ static void octeon_gcm_ghash_ctr_decrypt(struct octeon_gcm_reqctx *rctx,
 			pt_blk[1] = ct_blk[1] ^ ks[1];
 			memcpy(pt + i * GCM_BLOCK_SIZE, pt_blk, GCM_BLOCK_SIZE);
 
-			/* Issue AES for block i+1 after read — overlaps with next GFM */
-			if (i < n_full - 1) {
+			/*
+			 * Pre-trigger AES for next block (full or partial) after
+			 * the read — overlaps with next iteration's GFM trigger
+			 * and the memcpy above.
+			 */
+			if (i < n_full - 1 || remainder > 0) {
 				gcm_counter_inc(rctx->counter);
 				OCTEON_MT_COP2(rctx->counter[0], 0x010A);
 				OCTEON_MT_COP2(rctx->counter[1], 0x310B);
@@ -381,17 +379,21 @@ static void octeon_gcm_ghash_ctr_decrypt(struct octeon_gcm_reqctx *rctx,
 	}
 
 	if (remainder) {
-		u8 partial[GCM_BLOCK_SIZE] = { 0 };
-		u64 partial_u64[2];
+		u64 partial_u64[2] = { 0, 0 };
 		unsigned int j;
 
-		memcpy(partial, ct + n_full * GCM_BLOCK_SIZE, remainder);
-		memcpy(partial_u64, partial, GCM_BLOCK_SIZE);
+		/* Single copy into zero-initialized u64 buffer (no staging via u8[]) */
+		memcpy(partial_u64, ct + n_full * GCM_BLOCK_SIZE, remainder);
 
-		/* Issue AES for partial counter block */
-		gcm_counter_inc(rctx->counter);
-		OCTEON_MT_COP2(rctx->counter[0], 0x010A);
-		OCTEON_MT_COP2(rctx->counter[1], 0x310B);
+		/*
+		 * AES pre-triggered at end of last full-block iteration when
+		 * n_full > 0; trigger here only if there were no full blocks.
+		 */
+		if (n_full == 0) {
+			gcm_counter_inc(rctx->counter);
+			OCTEON_MT_COP2(rctx->counter[0], 0x010A);
+			OCTEON_MT_COP2(rctx->counter[1], 0x310B);
+		}
 
 		/* GFM the zero-padded partial ciphertext while AES computes */
 		OCTEON_MT_COP2(partial_u64[0], 0x025C);
@@ -401,8 +403,8 @@ static void octeon_gcm_ghash_ctr_decrypt(struct octeon_gcm_reqctx *rctx,
 		OCTEON_MF_COP2(ks[1], 0x0101);
 
 		for (j = 0; j < remainder; j++)
-			partial[j] ^= ((u8 *)ks)[j];
-		memcpy(pt + n_full * GCM_BLOCK_SIZE, partial, remainder);
+			((u8 *)partial_u64)[j] ^= ((u8 *)ks)[j];
+		memcpy(pt + n_full * GCM_BLOCK_SIZE, partial_u64, remainder);
 	}
 }
 
@@ -606,11 +608,16 @@ static int octeon_rfc4106_encrypt(struct aead_request *req)
 		__this_cpu_write(octeon_gcm_last_ctx, ctx);
 	}
 
-	/* Encrypt J0 for final tag computation: tag_enc = AES_K(J0) */
-	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
-
-	/* Clear GHASH accumulator (required before each new packet) */
-	octeon_gfm_clear_accum();
+	/*
+	 * Trigger AES(J0) and clear the GFM accumulator in parallel.
+	 * Both are required before processing data; doing them together
+	 * hides the AES(J0) latency inside the two GFM accumulator writes.
+	 */
+	OCTEON_MT_COP2(rctx->j0[0], 0x010A);
+	OCTEON_MT_COP2(rctx->j0[1], 0x310B);          /* triggers AES(J0) */
+	octeon_gfm_clear_accum();                      /* runs while AES computes */
+	OCTEON_MF_COP2(((u64 *)rctx->tag_enc)[0], 0x0100);
+	OCTEON_MF_COP2(((u64 *)rctx->tag_enc)[1], 0x0101);
 
 	/*
 	 * GHASH: Process AAD (ESP header only, not the explicit IV).
@@ -739,11 +746,12 @@ static int octeon_rfc4106_decrypt(struct aead_request *req)
 		__this_cpu_write(octeon_gcm_last_ctx, ctx);
 	}
 
-	/* Encrypt J0 for tag computation */
-	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
-
-	/* Clear GHASH accumulator (required before each new packet) */
-	octeon_gfm_clear_accum();
+	/* Trigger AES(J0) and clear GFM accumulator in parallel */
+	OCTEON_MT_COP2(rctx->j0[0], 0x010A);
+	OCTEON_MT_COP2(rctx->j0[1], 0x310B);          /* triggers AES(J0) */
+	octeon_gfm_clear_accum();                      /* runs while AES computes */
+	OCTEON_MF_COP2(((u64 *)rctx->tag_enc)[0], 0x0100);
+	OCTEON_MF_COP2(((u64 *)rctx->tag_enc)[1], 0x0101);
 
 	/*
 	 * GHASH: Process AAD (ESP header only, not the explicit IV).
@@ -846,8 +854,12 @@ static int octeon_gcm_encrypt(struct aead_request *req)
 		__this_cpu_write(octeon_gcm_last_ctx, ctx);
 	}
 
-	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
-	octeon_gfm_clear_accum();
+	/* Trigger AES(J0) and clear GFM accumulator in parallel */
+	OCTEON_MT_COP2(rctx->j0[0], 0x010A);
+	OCTEON_MT_COP2(rctx->j0[1], 0x310B);          /* triggers AES(J0) */
+	octeon_gfm_clear_accum();                      /* runs while AES computes */
+	OCTEON_MF_COP2(((u64 *)rctx->tag_enc)[0], 0x0100);
+	OCTEON_MF_COP2(((u64 *)rctx->tag_enc)[1], 0x0101);
 
 	if (assoclen > 0) {
 		u8 aad_local[GCM_SMALL_AAD_SIZE];
@@ -953,8 +965,12 @@ static int octeon_gcm_decrypt(struct aead_request *req)
 		__this_cpu_write(octeon_gcm_last_ctx, ctx);
 	}
 
-	octeon_gcm_encrypt_counter(rctx->j0, rctx->tag_enc);
-	octeon_gfm_clear_accum();
+	/* Trigger AES(J0) and clear GFM accumulator in parallel */
+	OCTEON_MT_COP2(rctx->j0[0], 0x010A);
+	OCTEON_MT_COP2(rctx->j0[1], 0x310B);          /* triggers AES(J0) */
+	octeon_gfm_clear_accum();                      /* runs while AES computes */
+	OCTEON_MF_COP2(((u64 *)rctx->tag_enc)[0], 0x0100);
+	OCTEON_MF_COP2(((u64 *)rctx->tag_enc)[1], 0x0101);
 
 	if (assoclen > 0) {
 		if (assoclen <= GCM_SMALL_AAD_SIZE) {
