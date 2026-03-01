@@ -1,6 +1,6 @@
 #!/bin/bash
 # verify.sh — Post-install verification for octeon-aes-gcm module
-# Run on EdgeRouter 6P after insmod octeon_aes_gcm.ko
+# Run on EdgeRouter 6P after installing octeon-aes-gcm .deb or insmod
 
 set -e
 
@@ -48,7 +48,8 @@ if lsmod | grep -q "octeon_aes_gcm"; then
     info "Module size: ${size} bytes"
 else
     fail "octeon_aes_gcm module NOT loaded"
-    info "Run: sudo insmod /tmp/octeon_aes_gcm.ko"
+    info "Run: sudo dpkg -i octeon-aes-gcm_*.deb"
+    info "  or: sudo insmod /config/modules/octeon_aes_gcm.ko"
     info "Check: dmesg | tail -20"
     exit 1
 fi

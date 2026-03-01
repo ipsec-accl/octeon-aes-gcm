@@ -9,9 +9,9 @@
 # After a firmware upgrade the kernel version may change, making the
 # pre-built .ko incompatible.  In that case this script logs a warning
 # and skips loading — rebuild the module against the new kernel and
-# copy the new .ko to /config/tmp/octeon_aes_gcm.ko to restore offload.
+# install an updated .deb (or copy the new .ko to /config/modules/) to restore offload.
 
-KO="/config/tmp/octeon_aes_gcm.ko"
+KO="/config/modules/octeon_aes_gcm.ko"
 EXPECTED_KERNEL="4.9.79-UBNT"
 RUNNING_KERNEL=$(uname -r)
 TAG="octeon-aes-gcm"

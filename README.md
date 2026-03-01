@@ -86,44 +86,38 @@ register addresses are sourced from
 
 ## 4. Installing the pre-built binary (no compilation needed)
 
-If you are running **EdgeOS 2.0.9**, you can use the pre-built kernel module (`octeon_aes_gcm.ko`) at the root of this repo.
-No cross-compiler or kernel source needed.
+If you are running **EdgeOS 2.0.9**, you can use the pre-built `.deb` package at
+the root of this repo. No cross-compiler or kernel source needed.
 
 If you are running a different EdgeOS version, see [Building from source](#building-from-source).
 
-### Step 1 — Get the files
-
-Clone this repo on any machine with internet access, or download the two files
-you need:
-- `octeon_aes_gcm.ko` — the kernel module
-- `load-octeon-gcm.sh` — the boot script
-
-### Step 2 — Copy the module to the router
-
-Upload the kernel module to `/config/tmp/` on the router. The `/config` partition
-persists across reboots and firmware upgrades — unlike `/tmp` which is cleared on
-every boot — making it the right place to store the module permanently.
+### Step 1 — Copy the .deb to the router
 
 ```bash
 # Run on your local machine.
 # Replace 192.168.1.1 with your router's IP, and admin with your username.
-scp octeon_aes_gcm.ko admin@192.168.1.1:/config/tmp/octeon_aes_gcm.ko
+scp octeon-aes-gcm_1.0.0-e300-4.9.79-UBNT_mips.deb admin@192.168.1.1:/tmp/
 ```
 
-### Step 3 — Load the module
+### Step 2 — Install with dpkg
 
 SSH into the router, then run:
 
 ```bash
-sudo insmod /config/tmp/octeon_aes_gcm.ko
+sudo dpkg -i /tmp/octeon-aes-gcm_1.0.0-e300-4.9.79-UBNT_mips.deb
 ```
+
+This installs the kernel module to `/config/modules/`, installs the boot script
+to `/config/scripts/pre-config.d/`, and **loads the module immediately** — no
+separate `insmod` needed.
 
 Verify it loaded:
 ```bash
-dmesg | grep octeon-aes-gcm
+grep octeon-aes-gcm /var/log/messages
+# → octeon-aes-gcm: Module loaded — hardware AES-GCM available for IPsec
 ```
 
-Expected output:
+Or check `dmesg`:
 ```
 octeon-aes-gcm: Octeon III AES-GCM hardware offload v1.0.0
 octeon-aes-gcm: COP2 AES + GFM engine, priority 500
@@ -137,38 +131,31 @@ octeon-aes-gcm: Registered gcm(aes) [octeon-gcm-aes]
 > sudo ipsec restart
 > ```
 
-### Step 4 — Set up automatic loading at boot
+### Step 3 — Make it persist across firmware upgrades
 
-EdgeOS runs scripts in `/config/scripts/pre-config.d/` **before** IPsec (charon)
-starts. Placing our script there means hardware GCM is available from the very
-first IPsec SA — no `ipsec restart` needed after boot.
-
-First, create the directory and upload the boot script from your local machine:
+EdgeOS automatically reinstalls `.deb` files found in
+`/config/data/firstboot/install-packages/` after a firmware upgrade. Run this
+once to register the package permanently:
 
 ```bash
-# Run on your local machine:
-scp load-octeon-gcm.sh admin@192.168.1.1:/config/tmp/load-octeon-gcm.sh
+sudo mkdir -p /config/data/firstboot/install-packages
+sudo cp /tmp/octeon-aes-gcm_*.deb /config/data/firstboot/install-packages/
 ```
 
-Then SSH into the router and install it:
-
-```bash
-sudo mkdir -p /config/scripts/pre-config.d
-sudo cp /config/tmp/load-octeon-gcm.sh /config/scripts/pre-config.d/load-octeon-gcm.sh
-sudo chmod +x /config/scripts/pre-config.d/load-octeon-gcm.sh
-```
-
-The script checks the running kernel version before loading. If the kernel changed
-after a firmware upgrade, it logs a warning and skips loading safely — you'll need
-to rebuild the module for the new kernel.
+After a firmware upgrade, the firstboot mechanism reinstalls the package and the
+boot script runs on every subsequent boot from `/config/scripts/pre-config.d/`,
+loading the module before IPsec (charon) starts. The boot script checks the
+running kernel version before loading; if the kernel changed after an upgrade, it
+logs a warning and skips loading safely — you'll need to rebuild the module for
+the new kernel.
 
 After the next reboot, confirm the module loaded automatically:
 ```bash
-ssh admin@192.168.1.1 "grep octeon-aes-gcm /var/log/messages"
+grep octeon-aes-gcm /var/log/messages
 # → octeon-aes-gcm: Module loaded — hardware AES-GCM available for IPsec
 ```
 
-### Step 5 — Configure IPsec to use AES-GCM
+### Step 4 — Configure IPsec to use AES-GCM
 
 If you already have an IPsec tunnel configured, you just need to update (or add) the
 ESP proposal to use AES-GCM. If you are starting from scratch, configure your tunnel
@@ -206,7 +193,7 @@ end-to-end in a live IPsec tunnel. Replace `aes128gcm128` with:
 | AES-192-GCM | `aes192gcm128` | `esp=aes192gcm128!` | Not tested |
 | AES-256-GCM | `aes256gcm128` | `esp=aes256gcm128!` | Not tested |
 
-### Step 6 — Verify hardware is being used
+### Step 5 — Verify hardware is being used
 
 **Check 1 — Confirm the driver registered in the kernel crypto API:**
 
@@ -374,19 +361,26 @@ make ARCH=mips CROSS_COMPILE=mips64-linux-gnuabi64- cavium_octeon_defconfig
 make ARCH=mips CROSS_COMPILE=mips64-linux-gnuabi64- prepare modules_prepare
 ```
 
-### Step 4 — Build the module
+### Step 4 — Build the module and package
 
 ```bash
 cd /path/to/octeon-aes-gcm/src
 make KDIR=/path/to/kernel_e300 \
      CROSS_COMPILE=mips64-linux-gnuabi64- \
      ARCH=mips
+make deb
 ```
 
-Output: `src/octeon_aes_gcm.ko`
+Output: `octeon-aes-gcm_1.0.0-e300-4.9.79-UBNT_mips.deb` (one directory up, at
+the repo root).
+
+`make deb` requires `dpkg-dev` on the build machine:
+```bash
+sudo apt install dpkg-dev
+```
 
 Then follow the [install steps above](#installing-the-pre-built-binary-no-compilation-needed)
-using your freshly built `.ko` instead of the pre-built one.
+using your freshly built `.deb`.
 
 ## 6. References
 
