@@ -32,10 +32,15 @@ CROSS_COMPILE ?= mips64-octeon-linux-gnu-
 # Package metadata for 'make deb'
 # Override if targeting a different platform or kernel:
 #   make deb PLATFORM=e300 KERNEL_VER=4.9.79-UBNT
+# Output: octeon-aes-gcm-e300_1.0.0+4.9.79ubnt-1_mips.deb
 PLATFORM    ?= e300
 KERNEL_VER  ?= 4.9.79-UBNT
-PKG_NAME    := octeon-aes-gcm
-PKG_VERSION := 1.0.0-$(PLATFORM)-$(KERNEL_VER)
+MOD_VERSION := 1.0.0
+PKG_NAME    := octeon-aes-gcm-$(PLATFORM)
+# Debian-style kernel qualifier: strip hyphen before vendor tag, lowercase
+# e.g. 4.9.79-UBNT -> 4.9.79ubnt
+KERNEL_VER_DEB := $(shell echo "$(KERNEL_VER)" | sed 's/-//' | tr 'A-Z' 'a-z')
+PKG_VERSION := $(MOD_VERSION)+$(KERNEL_VER_DEB)-1
 PKG_ARCH    := mips
 DEB_FILE    := ../$(PKG_NAME)_$(PKG_VERSION)_$(PKG_ARCH).deb
 LOAD_SCRIPT := ../load-octeon-gcm.sh

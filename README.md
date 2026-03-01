@@ -86,8 +86,9 @@ register addresses are sourced from
 
 ## 4. Installing the pre-built binary (no compilation needed)
 
-If you are running **EdgeOS 2.0.9**, you can use the pre-built `.deb` package at
-the root of this repo. No cross-compiler or kernel source needed.
+If you are running **EdgeOS 2.0.9** on an **EdgeRouter 6P or ER-4** (e300 platform),
+you can use the pre-built `.deb` package at the root of this repo.
+No cross-compiler or kernel source needed.
 
 If you are running a different EdgeOS version, see [Building from source](#building-from-source).
 
@@ -96,7 +97,7 @@ If you are running a different EdgeOS version, see [Building from source](#build
 ```bash
 # Run on your local machine.
 # Replace 192.168.1.1 with your router's IP, and admin with your username.
-scp octeon-aes-gcm_1.0.0-e300-4.9.79-UBNT_mips.deb admin@192.168.1.1:/tmp/
+scp octeon-aes-gcm-e300_1.0.0+4.9.79ubnt-1_mips.deb admin@192.168.1.1:/tmp/
 ```
 
 ### Step 2 — Install with dpkg
@@ -104,7 +105,7 @@ scp octeon-aes-gcm_1.0.0-e300-4.9.79-UBNT_mips.deb admin@192.168.1.1:/tmp/
 SSH into the router, then run:
 
 ```bash
-sudo dpkg -i /tmp/octeon-aes-gcm_1.0.0-e300-4.9.79-UBNT_mips.deb
+sudo dpkg -i /tmp/octeon-aes-gcm-e300_1.0.0+4.9.79ubnt-1_mips.deb
 ```
 
 This installs the kernel module to `/config/modules/`, installs the boot script
@@ -351,7 +352,7 @@ make KDIR=/path/to/kernel_e300 \
 make deb
 ```
 
-Output: `octeon-aes-gcm_1.0.0-e300-4.9.79-UBNT_mips.deb` (one directory up, at
+Output: `octeon-aes-gcm-e300_1.0.0+4.9.79ubnt-1_mips.deb` (one directory up, at
 the repo root).
 
 `make deb` requires `dpkg-dev` on the build machine:
