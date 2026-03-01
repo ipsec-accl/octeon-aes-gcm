@@ -108,13 +108,42 @@ SSH into the router, then run:
 sudo dpkg -i /tmp/octeon-aes-gcm-e300_1.0.0+4.9.79ubnt-1_mips.deb
 ```
 
-This installs the kernel module to `/config/modules/`, installs the boot script
-to `/config/scripts/pre-config.d/`, and **loads the module immediately** — no
-separate `insmod` needed.
+`dpkg -i` does the following in one step:
 
-Both installed paths are under `/config/`, which is EdgeOS's persistent partition
-and survives firmware upgrades automatically. No extra steps are needed for
-persistence — `dpkg -i` is the complete install.
+1. **Creates directories** (from the package structure, if they don't already exist):
+   ```
+   /config/modules/
+   /config/scripts/pre-config.d/
+   ```
+
+2. **Copies two files** into those directories:
+   ```
+   /config/modules/octeon_aes_gcm.ko
+   /config/scripts/pre-config.d/load-octeon-gcm.sh
+   ```
+
+3. **Runs the post-install script**, which loads the module immediately:
+   ```bash
+   insmod /config/modules/octeon_aes_gcm.ko
+   ```
+   If the running kernel version doesn't match `4.9.79-UBNT`, it skips loading and
+   logs a warning instead:
+   ```
+   octeon-aes-gcm postinst: WARNING: kernel mismatch -- skipping load
+   ```
+
+4. **On every subsequent boot**, EdgeOS automatically runs the boot script before
+   applying its configuration (and before IPsec / charon starts):
+   ```bash
+   # /config/scripts/pre-config.d/load-octeon-gcm.sh runs at boot:
+   insmod /config/modules/octeon_aes_gcm.ko
+   ```
+   This means hardware GCM is registered in the Linux Crypto API before the first
+   IPsec SA is negotiated — no `ipsec restart` needed after a reboot.
+
+Both installed paths are under `/config/`, which is EdgeOS's dedicated persistent
+partition (separate from the firmware image). They survive firmware upgrades
+automatically — `dpkg -i` is the complete and final install.
 
 Verify it loaded:
 ```bash
