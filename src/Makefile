@@ -72,8 +72,9 @@ test-load:
 # Build Debian package: octeon-aes-gcm_<version>_mips.deb
 # Contains the .ko and boot script; installs to /config/ so it survives firmware upgrades.
 # Requires dpkg-deb on the build machine (available on Raspbian).
-# Place the resulting .deb in /config/data/firstboot/install-packages/ on the router
-# so it is automatically reinstalled after a firmware upgrade.
+# After 'dpkg -i' no further steps are needed for persistence — both installed paths
+# (/config/modules/ and /config/scripts/pre-config.d/) are on the persistent /config/
+# partition and survive firmware upgrades automatically.
 deb: octeon_aes_gcm.ko
 	@which dpkg-deb >/dev/null 2>&1 || \
 		{ echo "ERROR: dpkg-deb not found — run: sudo apt-get install dpkg-dev"; exit 1; }

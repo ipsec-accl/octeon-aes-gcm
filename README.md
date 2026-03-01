@@ -111,6 +111,10 @@ This installs the kernel module to `/config/modules/`, installs the boot script
 to `/config/scripts/pre-config.d/`, and **loads the module immediately** — no
 separate `insmod` needed.
 
+Both installed paths are under `/config/`, which is EdgeOS's persistent partition
+and survives firmware upgrades automatically. No extra steps are needed for
+persistence — `dpkg -i` is the complete install.
+
 Verify it loaded:
 ```bash
 grep octeon-aes-gcm /var/log/messages
@@ -131,31 +135,7 @@ octeon-aes-gcm: Registered gcm(aes) [octeon-gcm-aes]
 > sudo ipsec restart
 > ```
 
-### Step 3 — Make it persist across firmware upgrades
-
-EdgeOS automatically reinstalls `.deb` files found in
-`/config/data/firstboot/install-packages/` after a firmware upgrade. Run this
-once to register the package permanently:
-
-```bash
-sudo mkdir -p /config/data/firstboot/install-packages
-sudo cp /tmp/octeon-aes-gcm_*.deb /config/data/firstboot/install-packages/
-```
-
-After a firmware upgrade, the firstboot mechanism reinstalls the package and the
-boot script runs on every subsequent boot from `/config/scripts/pre-config.d/`,
-loading the module before IPsec (charon) starts. The boot script checks the
-running kernel version before loading; if the kernel changed after an upgrade, it
-logs a warning and skips loading safely — you'll need to rebuild the module for
-the new kernel.
-
-After the next reboot, confirm the module loaded automatically:
-```bash
-grep octeon-aes-gcm /var/log/messages
-# → octeon-aes-gcm: Module loaded — hardware AES-GCM available for IPsec
-```
-
-### Step 4 — Configure IPsec to use AES-GCM
+### Step 3 — Configure IPsec to use AES-GCM
 
 If you already have an IPsec tunnel configured, you just need to update (or add) the
 ESP proposal to use AES-GCM. If you are starting from scratch, configure your tunnel
@@ -193,7 +173,7 @@ end-to-end in a live IPsec tunnel. Replace `aes128gcm128` with:
 | AES-192-GCM | `aes192gcm128` | `esp=aes192gcm128!` | Not tested |
 | AES-256-GCM | `aes256gcm128` | `esp=aes256gcm128!` | Not tested |
 
-### Step 5 — Verify hardware is being used
+### Step 4 — Verify hardware is being used
 
 **Check 1 — Confirm the driver registered in the kernel crypto API:**
 
